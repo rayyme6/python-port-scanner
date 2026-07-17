@@ -13,7 +13,6 @@ Only scan systems and networks you own or are explicitly authorized to test.
 Examples:
     python3 port_scanner.py 192.168.1.10 -p 1-1024
     python3 port_scanner.py example.com -p 22,80,443 --show-all
-  python3 port_scanner.py example.com -p 443,8443 --banner-threads 5
     python3 port_scanner.py example.com -p 443,8443 --banner-threads 5
     sudo .venv/bin/python port_scanner.py 192.168.1.10 --syn
 """
@@ -72,18 +71,29 @@ TLS_PROBE_PORTS = {
 # TLS ports where an encrypted HTTP request is appropriate.
 HTTPS_PROBE_PORTS = {443, 8443, 9443, 10443}
 
-# Errors caused by temporary pressure on the scanner itself. These should be
-# retried and must not be reported as if a remote firewall filtered the port.
+# Errors that clearly indicate pressure or exhaustion on the scanner itself.
+# EAGAIN/EWOULDBLOCK are deliberately handled separately: in timeout mode they
+# can surface for a connection that never completed, so reporting them as a
+# definite local resource failure would be misleading.
 TRANSIENT_LOCAL_ERRORS = {
     value
     for value in (
-        getattr(errno, "EAGAIN", None),
-        getattr(errno, "EWOULDBLOCK", None),
         getattr(errno, "ENOBUFS", None),
         getattr(errno, "ENOMEM", None),
         getattr(errno, "EMFILE", None),
         getattr(errno, "ENFILE", None),
         getattr(errno, "EADDRNOTAVAIL", None),
+    )
+    if value is not None
+}
+
+AMBIGUOUS_CONNECT_ERRORS = {
+    value
+    for value in (
+        getattr(errno, "EAGAIN", None),
+        getattr(errno, "EWOULDBLOCK", None),
+        getattr(errno, "EINPROGRESS", None),
+        getattr(errno, "EALREADY", None),
     )
     if value is not None
 }
@@ -221,14 +231,44 @@ def http_host_header(target, port, secure=False):
     return target if port == default_port else "{}:{}".format(target, port)
 
 
-def build_http_request(target, port, secure=False):
-    """Create a small hostname-aware HTTP HEAD request."""
+def build_http_request(target, port, secure=False, method="HEAD"):
+    """Create a small hostname-aware HTTP request."""
+    method = method.upper()
+    if method not in {"HEAD", "GET"}:
+        raise ValueError("unsupported HTTP probe method: {}".format(method))
     return (
-        "HEAD / HTTP/1.0\r\n"
+        "{} / HTTP/1.0\r\n"
         "Host: {}\r\n"
-        "User-Agent: python-port-scanner/4.0\r\n"
+        "User-Agent: python-port-scanner/4.1\r\n"
+        "Accept: */*\r\n"
         "Connection: close\r\n\r\n"
-    ).format(http_host_header(target, port, secure=secure)).encode()
+    ).format(
+        method,
+        http_host_header(target, port, secure=secure),
+    ).encode()
+
+
+def receive_response(sock, max_bytes=16384):
+    """Read enough of a response to capture its status line and headers."""
+    chunks = []
+    total = 0
+
+    while total < max_bytes:
+        try:
+            chunk = sock.recv(min(4096, max_bytes - total))
+        except (socket.timeout, ssl.SSLError):
+            break
+
+        if not chunk:
+            break
+
+        chunks.append(chunk)
+        total += len(chunk)
+        combined = b"".join(chunks)
+        if b"\r\n\r\n" in combined or b"\n\n" in combined:
+            break
+
+    return b"".join(chunks)
 
 
 def http_response_banner(data):
@@ -256,6 +296,72 @@ def certificate_name_value(name, key_name):
             if key == key_name:
                 return str(value)
     return ""
+
+
+def normalize_dns_name(value):
+    """Normalize a DNS name to lowercase IDNA ASCII without a trailing dot."""
+    value = value.rstrip(".")
+    try:
+        return value.encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        return value.lower()
+
+
+def dns_pattern_matches(pattern, hostname):
+    """Match an exact DNS name or a single-label leading wildcard."""
+    pattern = normalize_dns_name(pattern)
+    hostname = normalize_dns_name(hostname)
+
+    if "*" not in pattern:
+        return pattern == hostname
+
+    pattern_labels = pattern.split(".")
+    hostname_labels = hostname.split(".")
+    return (
+        len(pattern_labels) == len(hostname_labels)
+        and pattern_labels[0] == "*"
+        and pattern_labels[1:] == hostname_labels[1:]
+    )
+
+
+def certificate_matches_hostname(decoded, hostname):
+    """Best-effort hostname/IP matching without deprecated ssl.match_hostname()."""
+    if not decoded or not hostname:
+        return None
+
+    hostname = hostname.strip("[]").rstrip(".")
+    subject_alt_names = decoded.get("subjectAltName") or ()
+
+    if is_ip_literal(hostname):
+        expected_ip = ipaddress.ip_address(hostname)
+        ip_names = [
+            value
+            for name_type, value in subject_alt_names
+            if name_type in {"IP Address", "IP"}
+        ]
+        if not ip_names:
+            return False
+        for value in ip_names:
+            try:
+                if ipaddress.ip_address(value) == expected_ip:
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    dns_names = [
+        value
+        for name_type, value in subject_alt_names
+        if name_type == "DNS"
+    ]
+    candidates = dns_names
+    if not candidates:
+        common_name = certificate_name_value(decoded.get("subject"), "commonName")
+        candidates = [common_name] if common_name else []
+
+    if not candidates:
+        return False
+    return any(dns_pattern_matches(pattern, hostname) for pattern in candidates)
 
 
 def decode_certificate(der_certificate, hostname=None):
@@ -311,13 +417,9 @@ def decode_certificate(der_certificate, hostname=None):
             except (TypeError, ValueError, OverflowError):
                 pass
 
-        if hostname and not is_ip_literal(hostname):
-            matcher = getattr(ssl, "match_hostname", None)
-            if matcher is not None:
-                try:
-                    matcher(decoded, hostname.rstrip("."))
-                except (ssl.CertificateError, ValueError):
-                    details.append("hostname mismatch")
+        hostname_matches = certificate_matches_hostname(decoded, hostname)
+        if hostname_matches is False:
+            details.append("hostname mismatch")
 
     if not details:
         fingerprint = hashlib.sha256(der_certificate).hexdigest()[:16]
@@ -348,8 +450,17 @@ def probe_tls(target, ip, port, timeout, probe_https=False):
             response = b""
             if probe_https:
                 try:
-                    tls_socket.sendall(build_http_request(target, port, secure=True))
-                    response = tls_socket.recv(4096)
+                    # GET is more widely implemented by minimal/debug HTTPS
+                    # servers than HEAD. Only the response headers are retained.
+                    tls_socket.sendall(
+                        build_http_request(
+                            target,
+                            port,
+                            secure=True,
+                            method="GET",
+                        )
+                    )
+                    response = receive_response(tls_socket)
                 except (socket.timeout, OSError, ssl.SSLError):
                     response = b""
 
@@ -365,7 +476,7 @@ def probe_tls(target, ip, port, timeout, probe_https=False):
             if cipher_name:
                 details.append(cipher_name)
             details.extend(
-                decode_certificate(der_certificate, hostname=server_hostname)
+                decode_certificate(der_certificate, hostname=target)
             )
 
             return service, " | ".join(details)[:160]
@@ -434,8 +545,10 @@ def identify_service(target, ip, port, timeout):
         try:
             with socket.create_connection((ip, port), timeout=timeout) as sock:
                 sock.settimeout(timeout)
-                sock.sendall(build_http_request(target, port, secure=False))
-                data = sock.recv(4096)
+                sock.sendall(
+                    build_http_request(target, port, secure=False, method="HEAD")
+                )
+                data = receive_response(sock)
             response_banner = http_response_banner(data)
             if response_banner:
                 return "HTTP", response_banner[:160]
@@ -523,18 +636,38 @@ def _connect_probe(ip, port, timeout, retries=1):
 
     for attempt in range(retries + 1):
         try:
+            # connect() gives Python a chance to turn a timed-out operation into
+            # TimeoutError instead of exposing a platform-specific connect_ex()
+            # errno such as EAGAIN.
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
                 sock.settimeout(timeout)
-                error_code = sock.connect_ex((ip, port))
+                sock.connect((ip, port))
+            return make_result(port, "open", "connection succeeded")
 
-            if error_code == 0:
-                return make_result(port, "open", "connection succeeded")
+        except ConnectionRefusedError:
+            return make_result(port, "closed", "connection refused")
+        except (socket.timeout, TimeoutError):
+            return make_result(port, "filtered", "timeout")
+        except OSError as exc:
+            error_code = exc.errno
+            last_error = error_code
 
             if error_code == errno.ECONNREFUSED:
                 return make_result(port, "closed", "connection refused")
 
+            if error_code in AMBIGUOUS_CONNECT_ERRORS:
+                if attempt < retries:
+                    time.sleep(0.02 * (attempt + 1))
+                    continue
+                return make_result(
+                    port,
+                    "filtered",
+                    "connection did not complete: {}".format(
+                        os.strerror(error_code) if error_code else str(exc)
+                    ),
+                )
+
             if error_code in TRANSIENT_LOCAL_ERRORS:
-                last_error = error_code
                 if attempt < retries:
                     time.sleep(0.02 * (attempt + 1))
                     continue
@@ -546,29 +679,7 @@ def _connect_probe(ip, port, timeout, retries=1):
                     ),
                 )
 
-            if error_code == errno.ETIMEDOUT:
-                return make_result(port, "filtered", "timeout")
-
-            # Errors such as host/network unreachable or permission denied mean
-            # a connection could not be established, but not that the port was
-            # actively confirmed closed.
-            try:
-                reason = os.strerror(error_code)
-            except ValueError:
-                reason = "socket error {}".format(error_code)
-            return make_result(port, "filtered", reason)
-
-        except socket.timeout:
-            if attempt < retries:
-                continue
-            return make_result(port, "filtered", "timeout")
-        except OSError as exc:
-            last_error = exc.errno
-            if exc.errno in TRANSIENT_LOCAL_ERRORS and attempt < retries:
-                time.sleep(0.02 * (attempt + 1))
-                continue
-            state = "error" if exc.errno in TRANSIENT_LOCAL_ERRORS else "filtered"
-            return make_result(port, state, str(exc))
+            return make_result(port, "filtered", str(exc))
 
     return make_result(port, "error", "probe failed: {}".format(last_error))
 
@@ -856,8 +967,8 @@ def print_results(target, ip, results, elapsed, scan_type, show_all=False):
     # closed/filtered rows hidden unless --show-all was explicitly supplied.
     for result in displayed:
         detail = result["banner"] if result["state"] == "open" else result["reason"]
-        if len(detail) > 64:
-            detail = detail[:63] + "…"
+        if len(detail) > 120:
+            detail = detail[:119] + "…"
 
         print("  {:<8}{:<11}{:<18}{}".format(
             result["port"],

@@ -1,0 +1,56 @@
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Testing and coverage
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Packaging/build output
+build/
+dist/
+*.egg-info/
+
+# Environment and secret files
+.env
+.env.*
+!.env.example
+
+# Local TLS test certificates and private keys
+tls-test/
+cert.pem
+key.pem
+*.key
+
+# Generated scan reports
+reports/
+report.txt
+scan-report*.txt
+scan-report*.json
+scan-report*.csv
+
+# Local backup versions of the scanner
+port_scanner_before_*.py
+port_scanner_original.py
+port_scanner_v*.py
+port_scanner_tls*.py
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Operating-system files
+.DS_Store
+Thumbs.db
