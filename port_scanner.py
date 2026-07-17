@@ -18,9 +18,11 @@ Examples:
 """
 
 import argparse
+import csv
 import errno
 import hashlib
 import ipaddress
+import json
 import os
 import random
 import socket
@@ -38,6 +40,11 @@ try:
     SCAPY_AVAILABLE = True
 except ImportError:
     SCAPY_AVAILABLE = False
+
+
+SCANNER_NAME = "python-port-scanner"
+SCANNER_VERSION = "4.2"
+REPORT_FORMATS = ("auto", "text", "json", "csv")
 
 
 # Conventional service labels. These are fallbacks, not definitive proof of
@@ -239,12 +246,14 @@ def build_http_request(target, port, secure=False, method="HEAD"):
     return (
         "{} / HTTP/1.0\r\n"
         "Host: {}\r\n"
-        "User-Agent: python-port-scanner/4.1\r\n"
+        "User-Agent: {}/{}\r\n"
         "Accept: */*\r\n"
         "Connection: close\r\n\r\n"
     ).format(
         method,
         http_host_header(target, port, secure=secure),
+        SCANNER_NAME,
+        SCANNER_VERSION,
     ).encode()
 
 
@@ -920,21 +929,115 @@ def get_state_counts(results):
 
 
 def select_results(results, show_all):
-    """Return exactly the rows the user requested for display/export."""
+    """Select rows for terminal display."""
     if show_all:
         return list(results)
     return [result for result in results if result["state"] == "open"]
 
 
+def select_report_results(results, open_only):
+    """Select rows for a saved report independently of terminal display."""
+    if open_only:
+        return [result for result in results if result["state"] == "open"]
+    return list(results)
+
+
+def summary_dict(counts):
+    """Return stable JSON-friendly state totals, including any future states."""
+    summary = {
+        state: int(counts.get(state, 0))
+        for state in ("open", "closed", "filtered", "error")
+    }
+    for state, count in sorted(counts.items()):
+        if state not in summary:
+            summary[state] = int(count)
+    return summary
+
+
 def summary_text(counts):
+    summary = summary_dict(counts)
     parts = [
-        "{} open".format(counts.get("open", 0)),
-        "{} closed".format(counts.get("closed", 0)),
-        "{} filtered".format(counts.get("filtered", 0)),
+        "{} open".format(summary["open"]),
+        "{} closed".format(summary["closed"]),
+        "{} filtered".format(summary["filtered"]),
     ]
-    if counts.get("error", 0):
-        parts.append("{} error".format(counts["error"]))
+    if summary["error"]:
+        parts.append("{} error".format(summary["error"]))
+    for state, count in summary.items():
+        if state not in {"open", "closed", "filtered", "error"} and count:
+            parts.append("{} {}".format(count, state))
     return ", ".join(parts)
+
+
+def result_detail(result):
+    """Return the most useful human-readable detail for one result."""
+    if result["state"] == "open":
+        return result.get("banner", "")
+    return result.get("reason", "")
+
+
+def normalized_result(result):
+    """Return a stable, serializable representation of one port result."""
+    return {
+        "port": int(result.get("port", 0)),
+        "state": str(result.get("state", "unknown")),
+        "service": str(result.get("service", "unknown")),
+        "banner": str(result.get("banner", "")),
+        "reason": str(result.get("reason", "")),
+    }
+
+
+def resolve_output_format(path, requested_format="auto"):
+    """Resolve report format explicitly or from the output filename extension."""
+    requested_format = requested_format.lower()
+    if requested_format not in REPORT_FORMATS:
+        raise ValueError("unsupported output format: {}".format(requested_format))
+    if requested_format != "auto":
+        return requested_format
+
+    extension = os.path.splitext(os.fspath(path))[1].lower()
+    return {
+        ".json": "json",
+        ".csv": "csv",
+        ".txt": "text",
+        ".log": "text",
+    }.get(extension, "text")
+
+
+def build_report_document(
+    target,
+    ip,
+    results,
+    elapsed,
+    scan_type,
+    started_at,
+    finished_at,
+    open_only=False,
+):
+    """Build the structured document used by JSON reports."""
+    report_results = select_report_results(results, open_only)
+    counts = get_state_counts(results)
+    return {
+        "scanner": {
+            "name": SCANNER_NAME,
+            "version": SCANNER_VERSION,
+        },
+        "target": {
+            "input": target,
+            "resolved_ip": ip,
+        },
+        "scan": {
+            "type": scan_type,
+            "started_at": started_at.isoformat(timespec="seconds"),
+            "finished_at": finished_at.isoformat(timespec="seconds"),
+            "duration_seconds": round(float(elapsed), 6),
+            "ports_scanned": len(results),
+            "report_scope": "open-only" if open_only else "all-states",
+            "results_written": len(report_results),
+        },
+        "summary": summary_dict(counts),
+        "results": [normalized_result(result) for result in report_results],
+    }
 
 
 def print_results(target, ip, results, elapsed, scan_type, show_all=False):
@@ -963,10 +1066,8 @@ def print_results(target, ip, results, elapsed, scan_type, show_all=False):
         "------", "--------", "---------------", "------------------------------------"
     ))
 
-    # Iterate over 'displayed', never over the complete result list. This keeps
-    # closed/filtered rows hidden unless --show-all was explicitly supplied.
     for result in displayed:
-        detail = result["banner"] if result["state"] == "open" else result["reason"]
+        detail = result_detail(result)
         if len(detail) > 120:
             detail = detail[:119] + "…"
 
@@ -982,33 +1083,151 @@ def print_results(target, ip, results, elapsed, scan_type, show_all=False):
     print()
 
 
-def write_report(path, target, ip, results, elapsed, scan_type, show_all=False):
-    displayed = select_results(results, show_all)
+def write_text_report(
+    path,
+    target,
+    ip,
+    results,
+    elapsed,
+    scan_type,
+    started_at,
+    finished_at,
+    open_only=False,
+):
+    report_results = select_report_results(results, open_only)
     counts = get_state_counts(results)
 
     with open(path, "w", encoding="utf-8") as report:
         report.write("Port scan report\n")
+        report.write("Scanner   : {} {}\n".format(SCANNER_NAME, SCANNER_VERSION))
         report.write("Target    : {} ({})\n".format(target, ip))
         report.write("Scan type : {}\n".format(scan_type))
-        report.write(
-            "Date      : {}\n".format(
-                datetime.now().astimezone().isoformat(timespec="seconds")
-            )
-        )
-        report.write("Duration  : {:.2f}s\n".format(elapsed))
+        report.write("Started   : {}\n".format(
+            started_at.isoformat(timespec="seconds")
+        ))
+        report.write("Finished  : {}\n".format(
+            finished_at.isoformat(timespec="seconds")
+        ))
+        report.write("Duration  : {:.6f}s\n".format(elapsed))
+        report.write("Ports     : {} scanned\n".format(len(results)))
+        report.write("Scope     : {}\n".format(
+            "open ports only" if open_only else "all states"
+        ))
         report.write("Summary   : {}\n\n".format(summary_text(counts)))
-        report.write("{:<8}{:<11}{:<18}{}\n".format(
-            "PORT", "STATE", "SERVICE", "BANNER / REASON"
+        report.write("{:<8}{:<11}{:<18}{:<42}{}\n".format(
+            "PORT", "STATE", "SERVICE", "BANNER", "REASON"
         ))
 
-        for result in displayed:
-            detail = result["banner"] if result["state"] == "open" else result["reason"]
-            report.write("{:<8}{:<11}{:<18}{}\n".format(
-                result["port"],
-                result["state"],
-                result["service"],
-                detail,
+        for result in report_results:
+            normalized = normalized_result(result)
+            report.write("{:<8}{:<11}{:<18}{:<42}{}\n".format(
+                normalized["port"],
+                normalized["state"],
+                normalized["service"],
+                normalized["banner"],
+                normalized["reason"],
             ))
+
+
+def write_json_report(
+    path,
+    target,
+    ip,
+    results,
+    elapsed,
+    scan_type,
+    started_at,
+    finished_at,
+    open_only=False,
+):
+    document = build_report_document(
+        target,
+        ip,
+        results,
+        elapsed,
+        scan_type,
+        started_at,
+        finished_at,
+        open_only=open_only,
+    )
+    with open(path, "w", encoding="utf-8") as report:
+        json.dump(document, report, indent=2, ensure_ascii=False)
+        report.write("\n")
+
+
+def write_csv_report(
+    path,
+    target,
+    ip,
+    results,
+    elapsed,
+    scan_type,
+    started_at,
+    finished_at,
+    open_only=False,
+):
+    report_results = select_report_results(results, open_only)
+    fieldnames = [
+        "scanner_version",
+        "target",
+        "resolved_ip",
+        "scan_type",
+        "started_at",
+        "duration_seconds",
+        "port",
+        "state",
+        "service",
+        "banner",
+        "reason",
+    ]
+
+    with open(path, "w", encoding="utf-8", newline="") as report:
+        writer = csv.DictWriter(report, fieldnames=fieldnames)
+        writer.writeheader()
+        for result in report_results:
+            normalized = normalized_result(result)
+            writer.writerow({
+                "scanner_version": SCANNER_VERSION,
+                "target": target,
+                "resolved_ip": ip,
+                "scan_type": scan_type,
+                "started_at": started_at.isoformat(timespec="seconds"),
+                "duration_seconds": "{:.6f}".format(elapsed),
+                **normalized,
+            })
+
+
+def write_report(
+    path,
+    target,
+    ip,
+    results,
+    elapsed,
+    scan_type,
+    started_at,
+    finished_at,
+    output_format="auto",
+    open_only=False,
+):
+    """Write text, JSON, or CSV and return the resolved format and row count."""
+    resolved_format = resolve_output_format(path, output_format)
+    writers = {
+        "text": write_text_report,
+        "json": write_json_report,
+        "csv": write_csv_report,
+    }
+    writers[resolved_format](
+        path,
+        target,
+        ip,
+        results,
+        elapsed,
+        scan_type,
+        started_at,
+        finished_at,
+        open_only=open_only,
+    )
+    return resolved_format, len(select_report_results(results, open_only))
 
 
 # ---------------------------------------------------------------------------
@@ -1021,6 +1240,9 @@ EPILOG = """Examples:
   python3 port_scanner.py example.com -p 22,80,443 --show-all
   python3 port_scanner.py example.com -p 443,8443 --banner-threads 5
   python3 port_scanner.py 192.168.1.10 -o report.txt
+  python3 port_scanner.py 192.168.1.10 -o report.json
+  python3 port_scanner.py 192.168.1.10 -o report.csv --report-open-only
+  python3 port_scanner.py 192.168.1.10 -o results.data --output-format json
   sudo .venv/bin/python port_scanner.py 192.168.1.10 --syn --no-banner
 """
 
@@ -1119,7 +1341,7 @@ def build_parser():
     )
     parser.add_argument(
         "--show-all", action="store_true",
-        help="Display and export closed, filtered, and error states too",
+        help="Display closed, filtered, and error states in the terminal",
     )
     parser.add_argument(
         "--no-progress", action="store_true",
@@ -1127,7 +1349,18 @@ def build_parser():
     )
     parser.add_argument(
         "-o", "--output", metavar="FILE",
-        help="Write a plain-text report to FILE",
+        help="Write a report; .json and .csv select structured formats",
+    )
+    parser.add_argument(
+        "--output-format",
+        choices=REPORT_FORMATS,
+        default="auto",
+        help="Report format (default: auto from filename extension)",
+    )
+    parser.add_argument(
+        "--report-open-only",
+        action="store_true",
+        help="Save only open ports instead of all scanned port states",
     )
 
     return parser
@@ -1136,6 +1369,11 @@ def build_parser():
 def main():
     parser = build_parser()
     args = parser.parse_args()
+
+    if not args.output and args.output_format != "auto":
+        parser.error("--output-format requires --output")
+    if not args.output and args.report_open_only:
+        parser.error("--report-open-only requires --output")
 
     try:
         ip = resolve_target(args.target)
@@ -1149,6 +1387,7 @@ def main():
         "SYN scan (Scapy, batched)" if args.syn else "TCP connect scan (socket)"
     ))
 
+    scan_started_at = datetime.now().astimezone()
     started = time.perf_counter()
 
     try:
@@ -1188,6 +1427,7 @@ def main():
         )
 
     elapsed = time.perf_counter() - started
+    scan_finished_at = datetime.now().astimezone()
 
     print_results(
         args.target,
@@ -1200,16 +1440,24 @@ def main():
 
     if args.output:
         try:
-            write_report(
+            resolved_format, rows_written = write_report(
                 args.output,
                 args.target,
                 ip,
                 results,
                 elapsed,
                 scan_type,
-                show_all=args.show_all,
+                scan_started_at,
+                scan_finished_at,
+                output_format=args.output_format,
+                open_only=args.report_open_only,
             )
-            print("Report written to {}".format(args.output))
+            scope = "open ports" if args.report_open_only else "all states"
+            print(
+                "Report written to {} ({}; {} row(s); {})".format(
+                    args.output, resolved_format.upper(), rows_written, scope
+                )
+            )
         except OSError as exc:
             print("Error writing report: {}".format(exc), file=sys.stderr)
             return 1
