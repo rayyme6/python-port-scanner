@@ -1,11 +1,21 @@
 # Testing
 
-Install development dependencies inside a virtual environment:
+Create and activate a virtual environment, then install the project and its
+development tools in editable mode:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
-python -m pip install -r requirements-dev.txt
+python -m pip install --upgrade pip
+python -m pip install -e ".[dev]"
+```
+
+Verify all three supported launch methods:
+
+```bash
+portscan --help
+python -m portscanner --help
+python port_scanner.py --help
 ```
 
 Run the complete suite:
@@ -14,21 +24,21 @@ Run the complete suite:
 python -m pytest tests -v
 ```
 
-Run coverage enforcement:
+Run coverage enforcement against the installed package:
 
 ```bash
 python -m pytest tests \
-  --cov=port_scanner \
+  --cov=portscanner \
   --cov-report=term-missing \
   --cov-fail-under=75
 ```
 
-The v4.5 suite contains **130 tests** and currently reaches approximately
-**86% statement coverage**. Tests are network-free: sockets, TLS sessions,
-Scapy responses, thread-pool futures, Ctrl+C interruptions, and report writers
-are mocked or constructed locally.
+Build the wheel and source distribution:
 
-Interruption tests verify that completed connect results, classified SYN
-responses, and completed service banners survive Ctrl+C; partial text, JSON,
-and CSV reports carry explicit interruption and progress metadata; and the CLI
-returns exit status 130.
+```bash
+python -m build
+```
+
+The tests are network-free. Sockets, TLS sessions, Scapy responses,
+thread-pool futures, interruptions, and report writers are mocked or
+constructed locally.
