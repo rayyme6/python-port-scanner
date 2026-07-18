@@ -29,7 +29,7 @@ def run_command(arguments):
 
 
 def test_package_and_scanner_versions_agree():
-    assert portscanner.__version__ == "4.6"
+    assert portscanner.__version__ == "4.7"
     assert cli.SCANNER_VERSION == portscanner.__version__
 
 
@@ -62,7 +62,7 @@ def test_installed_portscan_command_is_available():
 
     completed = run_command([str(executable), "--version"])
     assert completed.returncode == 0
-    assert completed.stdout.strip().endswith("4.6")
+    assert completed.stdout.strip().endswith("4.7")
 
 
 def test_package_module_entry_point():
@@ -74,4 +74,4 @@ def test_package_module_entry_point():
 def test_legacy_launcher_remains_supported():
     completed = run_command([sys.executable, "port_scanner.py", "--version"])
     assert completed.returncode == 0
-    assert completed.stdout.strip().endswith("4.6")
+    assert completed.stdout.strip().endswith("4.7")

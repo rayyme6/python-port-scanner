@@ -54,3 +54,6 @@ port_scanner_tls*.py
 # Operating-system files
 .DS_Store
 Thumbs.db
+
+# Generated IPv6 scan reports
+ipv6-scan.*

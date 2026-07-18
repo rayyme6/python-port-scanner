@@ -34,14 +34,20 @@ def test_chunked_splits_values_without_dropping_items():
 
 
 def test_resolve_target_uses_ipv4_resolver(monkeypatch):
-    monkeypatch.setattr(socket, "gethostbyname", lambda target: "203.0.113.7")
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("203.0.113.7", 0))
+        ],
+    )
     assert scanner.resolve_target("example.test") == "203.0.113.7"
 
 
 def test_resolve_target_turns_dns_failure_into_value_error(monkeypatch):
-    def fail(_target):
+    def fail(*_args, **_kwargs):
         raise socket.gaierror("not found")
 
-    monkeypatch.setattr(socket, "gethostbyname", fail)
+    monkeypatch.setattr(socket, "getaddrinfo", fail)
     with pytest.raises(ValueError, match="could not resolve host"):
         scanner.resolve_target("missing.test")

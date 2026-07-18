@@ -1,8 +1,5 @@
 include README.md
 include TESTING.md
-include V4_4_RELEASE_NOTES.md
-include V4_5_RELEASE_NOTES.md
-include V4_6_RELEASE_NOTES.md
 include requirements.txt
 include requirements-dev.txt
 include pytest.ini

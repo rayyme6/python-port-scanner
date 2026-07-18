@@ -3,16 +3,17 @@
 portscanner.cli — TCP port scanner with HTTP, TLS, and banner identification.
 
 Scan engines:
-  * connect — multithreaded full TCP connections using Python sockets.
-              No special privileges required.
-  * syn     — rate-controlled, batched half-open SYN scanning using Scapy.
-              Requires raw-socket privileges (normally sudo on Linux).
+  * connect — multithreaded full TCP connections over IPv4 or IPv6 using
+              Python sockets. No special privileges required.
+  * syn     — rate-controlled, batched half-open IPv4/IPv6 SYN scanning using
+              Scapy. Requires raw-socket privileges (normally sudo on Linux).
 
 Only scan systems and networks you own or are explicitly authorized to test.
 
 Examples:
     portscan 192.168.1.10 -p 1-1024
-    portscan example.com -p 22,80,443 --show-all
+    portscan ::1 -p 22,80,443
+    portscan example.com -6 -p 22,80,443 --show-all
     portscan example.com --profile reliable --timeout 2
     portscan example.com -p 443,8443 --banner-threads 5
     sudo .venv/bin/portscan 192.168.1.10 --syn --profile reliable
@@ -21,6 +22,7 @@ Examples:
 import argparse
 import csv
 import errno
+import io
 import hashlib
 import ipaddress
 import json
@@ -29,6 +31,7 @@ import random
 import socket
 import ssl
 import sys
+from contextlib import redirect_stderr
 import tempfile
 import time
 from collections import Counter
@@ -37,12 +40,69 @@ from datetime import datetime, timezone
 
 from . import __version__
 
-try:
-    from scapy.all import ICMP, IP, TCP, conf, send, sr
+IP = IPv6 = TCP = ICMP = None
+conf = send = sr = None
+ICMPV6_ERROR_LAYERS = ()
+SCAPY_AVAILABLE = False
+SCAPY_IMPORT_ATTEMPTED = False
+SCAPY_IMPORT_ERROR = None
+SCAPY_IMPORT_DIAGNOSTICS = ""
 
-    SCAPY_AVAILABLE = True
-except ImportError:
-    SCAPY_AVAILABLE = False
+
+def load_scapy():
+    """Load Scapy lazily so connect scans do not initialize raw networking."""
+    global IP, IPv6, TCP, ICMP, conf, send, sr
+    global ICMPV6_ERROR_LAYERS, SCAPY_AVAILABLE
+    global SCAPY_IMPORT_ATTEMPTED, SCAPY_IMPORT_ERROR
+    global SCAPY_IMPORT_DIAGNOSTICS
+
+    if SCAPY_IMPORT_ATTEMPTED:
+        return SCAPY_AVAILABLE
+
+    SCAPY_IMPORT_ATTEMPTED = True
+    diagnostics = io.StringIO()
+    try:
+        # Scapy performs route discovery while importing IPv6 support. Capture
+        # its diagnostics and report a concise error only when SYN mode is used.
+        with redirect_stderr(diagnostics):
+            from scapy.all import (  # type: ignore[import-not-found]
+                ICMP as scapy_icmp,
+                IP as scapy_ip,
+                IPv6 as scapy_ipv6,
+                TCP as scapy_tcp,
+                conf as scapy_conf,
+                send as scapy_send,
+                sr as scapy_sr,
+            )
+            from scapy.layers.inet6 import (  # type: ignore[import-not-found]
+                ICMPv6DestUnreach,
+                ICMPv6PacketTooBig,
+                ICMPv6ParamProblem,
+                ICMPv6TimeExceeded,
+            )
+
+        IP = scapy_ip
+        IPv6 = scapy_ipv6
+        TCP = scapy_tcp
+        ICMP = scapy_icmp
+        conf = scapy_conf
+        send = scapy_send
+        sr = scapy_sr
+        ICMPV6_ERROR_LAYERS = (
+            ICMPv6DestUnreach,
+            ICMPv6PacketTooBig,
+            ICMPv6TimeExceeded,
+            ICMPv6ParamProblem,
+        )
+        SCAPY_AVAILABLE = True
+        SCAPY_IMPORT_ERROR = None
+    except Exception as exc:  # Scapy can fail while initializing route tables.
+        SCAPY_AVAILABLE = False
+        SCAPY_IMPORT_ERROR = exc
+    finally:
+        SCAPY_IMPORT_DIAGNOSTICS = diagnostics.getvalue()
+
+    return SCAPY_AVAILABLE
 
 
 SCANNER_NAME = "python-port-scanner"
@@ -199,12 +259,111 @@ def parse_ports(port_spec):
     return sorted(ports)
 
 
-def resolve_target(target):
-    """Resolve a hostname or IPv4 address to an IPv4 address."""
+def strip_address_brackets(value):
+    """Remove URI-style brackets from an IPv6 literal."""
+    value = str(value).strip()
+    if value.startswith("[") and value.endswith("]"):
+        return value[1:-1]
+    return value
+
+
+def address_family(address):
+    """Return socket.AF_INET or socket.AF_INET6 for an IP literal."""
+    parsed = ipaddress.ip_address(strip_address_brackets(address))
+    return socket.AF_INET6 if parsed.version == 6 else socket.AF_INET
+
+
+def address_family_name(address_or_family):
+    """Return a stable human-readable address-family label."""
+    family = (
+        address_or_family
+        if isinstance(address_or_family, int)
+        else address_family(address_or_family)
+    )
+    if family == socket.AF_INET6:
+        return "IPv6"
+    if family == socket.AF_INET:
+        return "IPv4"
+    return "unknown"
+
+
+def socket_endpoint(address, port):
+    """Build the correct connect() endpoint for IPv4 or IPv6."""
+    address = strip_address_brackets(address)
+    if address_family(address) == socket.AF_INET:
+        return address, int(port)
+
+    host = address
+    scope_id = 0
+    if "%" in address:
+        host, scope = address.rsplit("%", 1)
+        try:
+            scope_id = int(scope)
+        except ValueError:
+            try:
+                scope_id = socket.if_nametoindex(scope)
+            except (AttributeError, OSError):
+                raise ValueError("unknown IPv6 scope interface '{}'".format(scope))
+    return host, int(port), 0, scope_id
+
+
+def resolve_target(target, family="auto"):
+    """Resolve a hostname or IP literal to one IPv4 or IPv6 address.
+
+    ``auto`` preserves the scanner's historical IPv4 preference when both
+    families are available, while still accepting IPv6 literals and falling
+    back to IPv6-only DNS results. ``ipv4`` and ``ipv6`` force one family.
+    """
+    if family not in {"auto", "ipv4", "ipv6"}:
+        raise ValueError("unknown address family: {}".format(family))
+
+    candidate = strip_address_brackets(target)
     try:
-        return socket.gethostbyname(target)
+        literal = ipaddress.ip_address(candidate)
+    except ValueError:
+        literal = None
+
+    if literal is not None:
+        literal_family = "ipv6" if literal.version == 6 else "ipv4"
+        if family != "auto" and family != literal_family:
+            raise ValueError(
+                "target '{}' is {}, but --{} was requested".format(
+                    target, literal_family.upper(), "6" if family == "ipv6" else "4"
+                )
+            )
+        return str(literal)
+
+    requested_family = {
+        "auto": socket.AF_UNSPEC,
+        "ipv4": socket.AF_INET,
+        "ipv6": socket.AF_INET6,
+    }[family]
+
+    try:
+        records = socket.getaddrinfo(
+            candidate,
+            None,
+            requested_family,
+            socket.SOCK_STREAM,
+        )
     except socket.gaierror:
         raise ValueError("could not resolve host '{}'".format(target))
+
+    addresses = []
+    for record_family, _socktype, _protocol, _canonname, sockaddr in records:
+        if record_family not in {socket.AF_INET, socket.AF_INET6}:
+            continue
+        address = sockaddr[0]
+        item = (record_family, address)
+        if item not in addresses:
+            addresses.append(item)
+
+    if not addresses:
+        raise ValueError("could not resolve host '{}'".format(target))
+
+    if family == "auto":
+        addresses.sort(key=lambda item: 0 if item[0] == socket.AF_INET else 1)
+    return addresses[0][1]
 
 
 def chunked(values, size):
@@ -279,16 +438,19 @@ def readable_banner(data, port):
 def is_ip_literal(value):
     """Return True when value is an IPv4 or IPv6 literal rather than a hostname."""
     try:
-        ipaddress.ip_address(value.strip("[]"))
+        ipaddress.ip_address(strip_address_brackets(value))
         return True
     except ValueError:
         return False
 
 
 def http_host_header(target, port, secure=False):
-    """Build an HTTP Host header while preserving the user's original hostname."""
+    """Build a hostname-aware HTTP Host header, including IPv6 brackets."""
     default_port = 443 if secure else 80
-    return target if port == default_port else "{}:{}".format(target, port)
+    host = strip_address_brackets(target)
+    if is_ip_literal(host) and address_family(host) == socket.AF_INET6:
+        host = "[{}]".format(host)
+    return host if port == default_port else "{}:{}".format(host, port)
 
 
 def build_http_request(target, port, secure=False, method="HEAD"):
@@ -391,7 +553,7 @@ def certificate_matches_hostname(decoded, hostname):
     if not decoded or not hostname:
         return None
 
-    hostname = hostname.strip("[]").rstrip(".")
+    hostname = strip_address_brackets(hostname).rstrip(".")
     subject_alt_names = decoded.get("subjectAltName") or ()
 
     if is_ip_literal(hostname):
@@ -498,7 +660,7 @@ def probe_tls(target, ip, port, timeout, probe_https=False):
 
     server_hostname = None if is_ip_literal(target) else target.rstrip(".")
 
-    with socket.create_connection((ip, port), timeout=timeout) as raw_socket:
+    with socket.create_connection((strip_address_brackets(ip), port), timeout=timeout) as raw_socket:
         raw_socket.settimeout(timeout)
         with context.wrap_socket(
             raw_socket,
@@ -573,9 +735,10 @@ def identify_service(target, ip, port, timeout):
     # Telnet often identify themselves immediately after a TCP connection.
     data = b""
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        family = address_family(ip)
+        with socket.socket(family, socket.SOCK_STREAM) as sock:
             sock.settimeout(timeout)
-            sock.connect((ip, port))
+            sock.connect(socket_endpoint(ip, port))
             sock.settimeout(min(timeout, 0.8))
             try:
                 data = sock.recv(2048)
@@ -605,7 +768,9 @@ def identify_service(target, ip, port, timeout):
     # best-effort probe for an otherwise unknown silent service.
     if port in HTTP_PROBE_PORTS or service == "unknown":
         try:
-            with socket.create_connection((ip, port), timeout=timeout) as sock:
+            with socket.create_connection(
+                (strip_address_brackets(ip), port), timeout=timeout
+            ) as sock:
                 sock.settimeout(timeout)
                 sock.sendall(
                     build_http_request(target, port, secure=False, method="HEAD")
@@ -747,9 +912,10 @@ def _connect_probe(ip, port, timeout, retries=1):
             # connect() gives Python a chance to turn a timed-out operation into
             # TimeoutError instead of exposing a platform-specific connect_ex()
             # errno such as EAGAIN.
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            family = address_family(ip)
+            with socket.socket(family, socket.SOCK_STREAM) as sock:
                 sock.settimeout(timeout)
-                sock.connect((ip, port))
+                sock.connect(socket_endpoint(ip, port))
             return make_result(port, "open", "connection succeeded")
 
         except ConnectionRefusedError:
@@ -903,11 +1069,30 @@ def classify_syn_response(response):
             "ICMP type {} code {}".format(int(icmp.type), int(icmp.code)),
         )
 
+    for layer in ICMPV6_ERROR_LAYERS:
+        if response.haslayer(layer):
+            icmp = response[layer]
+            return (
+                "filtered",
+                "ICMPv6 type {} code {}".format(
+                    int(getattr(icmp, "type", -1)),
+                    int(getattr(icmp, "code", 0)),
+                ),
+            )
+
     return "filtered", "unexpected response"
 
 
+def network_layer(ip):
+    """Create the matching Scapy IPv4 or IPv6 network layer."""
+    address = strip_address_brackets(ip)
+    if address_family(address) == socket.AF_INET6:
+        return IPv6(dst=address)
+    return IP(dst=address)
+
+
 def build_syn_packets(ip, ports):
-    """Create SYN packets with independently randomized source ports."""
+    """Create IPv4/IPv6 SYN packets with randomized source ports."""
     packets = []
     used_source_ports = set()
 
@@ -918,7 +1103,7 @@ def build_syn_packets(ip, ports):
         used_source_ports.add(source_port)
 
         packets.append(
-            IP(dst=ip)
+            network_layer(ip)
             / TCP(
                 sport=source_port,
                 dport=port,
@@ -947,10 +1132,13 @@ def syn_scan(
     slower batches. A port is marked filtered only after every attempt fails to
     obtain a response. Ctrl+C preserves every response classified so far.
     """
-    if not SCAPY_AVAILABLE:
+    if not SCAPY_AVAILABLE and not load_scapy():
+        detail = "" if SCAPY_IMPORT_ERROR is None else ": {}".format(
+            SCAPY_IMPORT_ERROR
+        )
         raise RuntimeError(
-            "Scapy is not installed. Activate the virtual environment and run "
-            "'pip install -r requirements.txt'."
+            "Scapy is unavailable{}. Activate the virtual environment and run "
+            "'pip install -r requirements.txt'.".format(detail)
         )
 
     if hasattr(os, "geteuid") and os.geteuid() != 0:
@@ -1005,7 +1193,7 @@ def syn_scan(
 
                     if state == "open" and response.haslayer(TCP):
                         reset_packets.append(
-                            IP(dst=ip)
+                            network_layer(ip)
                             / TCP(
                                 sport=int(sent_packet[TCP].sport),
                                 dport=port,
@@ -1209,6 +1397,7 @@ def build_report_document(
         "target": {
             "input": target,
             "resolved_ip": ip,
+            "address_family": address_family_name(ip),
         },
         "scan": {
             "type": scan_type,
@@ -1322,6 +1511,7 @@ def write_text_report(
         report.write("Port scan report\n")
         report.write("Scanner   : {} {}\n".format(SCANNER_NAME, SCANNER_VERSION))
         report.write("Target    : {} ({})\n".format(target, ip))
+        report.write("Family    : {}\n".format(address_family_name(ip)))
         report.write("Scan type : {}\n".format(scan_type))
         report.write("Status    : {}\n".format(status))
         if interrupted_stage:
@@ -1442,6 +1632,7 @@ def write_csv_report(
         "scanner_version",
         "target",
         "resolved_ip",
+        "address_family",
         "scan_type",
         "scan_status",
         "interrupted_stage",
@@ -1471,6 +1662,7 @@ def write_csv_report(
         "scanner_version": SCANNER_VERSION,
         "target": target,
         "resolved_ip": ip,
+        "address_family": address_family_name(ip),
         "scan_type": scan_type,
         "scan_status": status,
         "interrupted_stage": interrupted_stage or "",
@@ -1549,6 +1741,8 @@ def write_report(
 
 EPILOG = """Examples:
   portscan 192.168.1.10 -p 1-1024
+  portscan ::1 -p 22,80,443
+  portscan example.com -6 -p 22,80,443
   portscan 192.168.1.10 --profile fast
   portscan example.com --profile reliable --timeout 2
   sudo .venv/bin/portscan 192.168.1.10 --syn --profile reliable
@@ -1656,7 +1850,7 @@ def build_parser():
     parser = argparse.ArgumentParser(
         prog=os.path.basename(sys.argv[0]) or "portscan",
         description=(
-            "TCP port scanner with multithreaded connect scanning and "
+            "IPv4/IPv6 TCP port scanner with multithreaded connect scanning and "
             "rate-controlled batched SYN scanning. Only scan authorized targets."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1668,7 +1862,18 @@ def build_parser():
         action="version",
         version="%(prog)s {}".format(SCANNER_VERSION),
     )
-    parser.add_argument("target", help="Target IPv4 address or hostname")
+    parser.add_argument(
+        "target", help="Target IPv4/IPv6 address or hostname"
+    )
+    family_group = parser.add_mutually_exclusive_group()
+    family_group.add_argument(
+        "-4", "--ipv4", action="store_true",
+        help="Resolve hostnames to IPv4 only",
+    )
+    family_group.add_argument(
+        "-6", "--ipv6", action="store_true",
+        help="Resolve hostnames to IPv6 only",
+    )
     parser.add_argument(
         "-p", "--ports", default="1-1024",
         help="Ports such as '22,80,443' or '1-1024' (default: 1-1024)",
@@ -1752,8 +1957,13 @@ def main():
     except ValueError as exc:
         parser.error(str(exc))
 
+    family_preference = "ipv6" if args.ipv6 else "ipv4" if args.ipv4 else "auto"
     try:
-        ip = resolve_target(args.target)
+        if family_preference == "auto":
+            # Keep one-argument monkeypatches and third-party callers compatible.
+            ip = resolve_target(args.target)
+        else:
+            ip = resolve_target(args.target, family=family_preference)
         ports = parse_ports(args.ports)
     except ValueError as exc:
         parser.error(str(exc))
@@ -1765,6 +1975,7 @@ def main():
     )
 
     print("\nTarget: {} ({})".format(args.target, ip))
+    print("Family: {}".format(address_family_name(ip)))
     print("Ports : {}".format(len(ports)))
     print("Mode  : {}".format(scan_type))
     override_text = ", ".join(profile_overrides) or "none"

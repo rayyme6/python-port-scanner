@@ -39,6 +39,16 @@ Build the wheel and source distribution:
 python -m build
 ```
 
-The tests are network-free. Sockets, TLS sessions, Scapy responses,
-thread-pool futures, interruptions, and report writers are mocked or
+The automated tests are network-free. IPv4/IPv6 resolution, socket endpoints,
+HTTP Host headers, TLS sessions, Scapy IPv4/IPv6 packet selection, ICMP/ICMPv6
+responses, thread-pool futures, interruptions, and report writers are mocked or
 constructed locally.
+
+The v4.7 suite contains 151 tests and enforces at least 75% package coverage.
+A local manual IPv6 smoke test can be run without scanning another device:
+
+```bash
+python -m http.server 8765 --bind ::1
+# In another terminal:
+portscan ::1 -p 8765
+```
