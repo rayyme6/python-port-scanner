@@ -108,6 +108,8 @@ def load_scapy():
 SCANNER_NAME = "python-port-scanner"
 SCANNER_VERSION = __version__
 REPORT_FORMATS = ("auto", "text", "json", "csv")
+DEFAULT_MAX_TARGETS = 256
+DEFAULT_MAX_PROBES = 1_000_000
 
 DEFAULT_PROFILE = "balanced"
 PROFILE_SETTING_NAMES = ("timeout", "threads", "batch_size", "inter", "retries")
@@ -370,6 +372,161 @@ def chunked(values, size):
     """Yield slices of values with at most size entries each."""
     for start in range(0, len(values), size):
         yield values[start:start + size]
+
+
+def read_target_file(path):
+    """Read target specifications from a UTF-8 text file.
+
+    Blank lines and lines beginning with ``#`` are ignored. Inline comments are
+    supported after whitespace, so ``192.0.2.1  # router`` is valid.
+    """
+    specifications = []
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            for line_number, raw_line in enumerate(stream, start=1):
+                line = raw_line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if " #" in line:
+                    line = line.split(" #", 1)[0].rstrip()
+                if not line:
+                    continue
+                specifications.append(line)
+    except OSError as exc:
+        raise ValueError("could not read target file '{}': {}".format(path, exc))
+    return specifications
+
+
+def network_host_count(network):
+    """Return the number of addresses yielded by ``network.hosts()``."""
+    if network.version == 4:
+        if network.prefixlen >= 31:
+            return int(network.num_addresses)
+        return max(0, int(network.num_addresses) - 2)
+    if network.prefixlen >= 127:
+        return int(network.num_addresses)
+    return max(0, int(network.num_addresses) - 1)
+
+
+def parse_network_spec(specification):
+    """Return an ip_network object for a CIDR specification, or ``None``."""
+    specification = str(specification).strip()
+    if "/" not in specification:
+        return None
+
+    # Accept URI-style bracketed IPv6 CIDRs such as ``[2001:db8::]/126``.
+    if specification.startswith("[") and "]" in specification:
+        closing = specification.index("]")
+        specification = specification[1:closing] + specification[closing + 1:]
+    try:
+        return ipaddress.ip_network(specification, strict=False)
+    except ValueError:
+        return None
+
+
+def collect_targets(
+    positional_targets,
+    target_files=None,
+    family="auto",
+    max_targets=DEFAULT_MAX_TARGETS,
+):
+    """Expand direct targets, target files, and CIDR ranges safely.
+
+    Targets are deduplicated by resolved address while preserving first-seen
+    order. CIDR ranges use ``ipaddress.ip_network(...).hosts()`` so ordinary
+    IPv4 network and broadcast addresses are not scanned.
+    """
+    max_targets = int(max_targets)
+    if max_targets <= 0:
+        raise ValueError("max targets must be greater than zero")
+
+    specifications = [str(value).strip() for value in positional_targets or []]
+    for file_path in target_files or []:
+        specifications.extend(read_target_file(file_path))
+    specifications = [value for value in specifications if value]
+    if not specifications:
+        raise ValueError("provide at least one TARGET or --targets-file FILE")
+
+    targets = []
+    seen = set()
+
+    def add_target(input_value, resolved_ip, expanded_from=None):
+        key = (address_family(resolved_ip), resolved_ip)
+        if key in seen:
+            return
+        if len(targets) >= max_targets:
+            raise ValueError(
+                "target expansion exceeds --max-targets {} (increase the limit "
+                "only for an authorized scan)".format(max_targets)
+            )
+        seen.add(key)
+        targets.append({
+            "input": str(input_value),
+            "resolved_ip": str(resolved_ip),
+            "address_family": address_family_name(resolved_ip),
+            "expanded_from": expanded_from,
+        })
+
+    for specification in specifications:
+        network = parse_network_spec(specification)
+        if "/" in specification and network is None:
+            raise ValueError("invalid CIDR target: '{}'".format(specification))
+        if network is not None:
+            network_family = "ipv6" if network.version == 6 else "ipv4"
+            if family != "auto" and family != network_family:
+                raise ValueError(
+                    "target '{}' is {}, but --{} was requested".format(
+                        specification,
+                        network_family.upper(),
+                        "6" if family == "ipv6" else "4",
+                    )
+                )
+            remaining = max_targets - len(targets)
+            count = network_host_count(network)
+            overlapping = 0
+            for _seen_family, seen_address in seen:
+                try:
+                    if ipaddress.ip_address(seen_address) in network:
+                        overlapping += 1
+                except ValueError:
+                    continue
+            new_count = max(0, count - overlapping)
+            if new_count > remaining:
+                raise ValueError(
+                    "CIDR '{}' expands to {} host(s) ({} new), exceeding the "
+                    "remaining --max-targets capacity of {}".format(
+                        specification, count, new_count, remaining
+                    )
+                )
+            for host in network.hosts():
+                add_target(str(host), str(host), expanded_from=specification)
+            continue
+
+        if family == "auto":
+            # Preserve compatibility with one-argument resolvers and callers.
+            resolved = resolve_target(specification)
+        else:
+            resolved = resolve_target(specification, family=family)
+        add_target(specification, resolved)
+
+    if not targets:
+        raise ValueError("no usable targets were produced")
+    return targets
+
+
+def validate_probe_plan(target_count, port_count, max_probes=DEFAULT_MAX_PROBES):
+    """Validate and return the planned target/port probe count."""
+    max_probes = int(max_probes)
+    if max_probes <= 0:
+        raise ValueError("max probes must be greater than zero")
+    planned = int(target_count) * int(port_count)
+    if planned > max_probes:
+        raise ValueError(
+            "scan would schedule {:,} target-port probe(s), exceeding "
+            "--max-probes {:,}; narrow the targets/ports or explicitly raise "
+            "the limit for an authorized scan".format(planned, max_probes)
+        )
+    return planned
 
 
 # ---------------------------------------------------------------------------
@@ -1734,6 +1891,232 @@ def write_report(
     return resolved_format, len(select_report_results(results, open_only))
 
 
+
+def aggregate_state_counts(target_runs):
+    """Combine port-state counts across target runs."""
+    counts = Counter()
+    for run in target_runs:
+        counts.update(get_state_counts(run.get("results", [])))
+    return counts
+
+
+def build_batch_report_document(
+    target_runs,
+    scan_type,
+    started_at,
+    finished_at,
+    elapsed,
+    ports_per_target,
+    targets_requested,
+    planned_probes,
+    open_only=False,
+    profile=DEFAULT_PROFILE,
+    effective_settings=None,
+    profile_overrides=None,
+    status="completed",
+):
+    """Build a structured multi-target JSON report."""
+    documents = []
+    for run in target_runs:
+        document = build_report_document(
+            run["target"],
+            run["ip"],
+            run["results"],
+            run["elapsed"],
+            scan_type,
+            run["started_at"],
+            run["finished_at"],
+            open_only=open_only,
+            profile=profile,
+            effective_settings=effective_settings,
+            profile_overrides=profile_overrides,
+            status=run["status"],
+            interrupted_stage=run.get("interrupted_stage"),
+            ports_requested=ports_per_target,
+            stage_completed=run.get("stage_completed"),
+            stage_total=run.get("stage_total"),
+        )
+        document["target"]["expanded_from"] = run.get("expanded_from")
+        documents.append(document)
+
+    completed_probes = sum(len(run.get("results", [])) for run in target_runs)
+    completed_targets = sum(1 for run in target_runs if run["status"] == "completed")
+    report_rows = sum(len(document["results"]) for document in documents)
+    return {
+        "scanner": {"name": SCANNER_NAME, "version": SCANNER_VERSION},
+        "batch": {
+            "status": status,
+            "interrupted": status == "interrupted",
+            "started_at": started_at.isoformat(timespec="seconds"),
+            "finished_at": finished_at.isoformat(timespec="seconds"),
+            "duration_seconds": round(float(elapsed), 6),
+            "targets_requested": int(targets_requested),
+            "targets_started": len(target_runs),
+            "targets_completed": completed_targets,
+            "ports_per_target": int(ports_per_target),
+            "planned_probes": int(planned_probes),
+            "completed_probes": completed_probes,
+            "completion_percent": round(
+                (completed_probes / planned_probes) * 100.0, 4
+            ) if planned_probes else 100.0,
+            "report_scope": "open-only" if open_only else "all-states",
+            "results_written": report_rows,
+            "profile": profile,
+            "profile_overrides": list(profile_overrides or []),
+            "effective_settings": normalized_scan_settings(effective_settings),
+        },
+        "summary": summary_dict(aggregate_state_counts(target_runs)),
+        "targets": documents,
+    }
+
+
+def write_batch_json_report(path, document):
+    with open(path, "w", encoding="utf-8") as report:
+        json.dump(document, report, indent=2, ensure_ascii=False)
+        report.write("\n")
+
+
+def write_batch_text_report(path, document):
+    batch = document["batch"]
+    with open(path, "w", encoding="utf-8") as report:
+        report.write("Multi-target port scan report\n")
+        report.write("Scanner    : {} {}\n".format(SCANNER_NAME, SCANNER_VERSION))
+        report.write("Status     : {}\n".format(batch["status"]))
+        report.write("Targets    : {} started, {} completed, {} requested\n".format(
+            batch["targets_started"],
+            batch["targets_completed"],
+            batch["targets_requested"],
+        ))
+        report.write("Probes     : {}/{} completed ({:.2f}%)\n".format(
+            batch["completed_probes"],
+            batch["planned_probes"],
+            batch["completion_percent"],
+        ))
+        report.write("Started    : {}\n".format(batch["started_at"]))
+        report.write("Finished   : {}\n".format(batch["finished_at"]))
+        report.write("Duration   : {:.6f}s\n".format(batch["duration_seconds"]))
+        report.write("Summary    : {}\n\n".format(
+            summary_text(Counter(document["summary"]))
+        ))
+        for index, target_document in enumerate(document["targets"], start=1):
+            target = target_document["target"]
+            scan = target_document["scan"]
+            report.write("=" * 88 + "\n")
+            report.write("Target {}/{}: {} ({}) [{}]\n".format(
+                index,
+                len(document["targets"]),
+                target["input"],
+                target["resolved_ip"],
+                target["address_family"],
+            ))
+            if target.get("expanded_from"):
+                report.write("Expanded from: {}\n".format(target["expanded_from"]))
+            report.write("Status: {} | Duration: {:.6f}s | Summary: {}\n".format(
+                scan["status"],
+                scan["duration_seconds"],
+                summary_text(Counter(target_document["summary"])),
+            ))
+            report.write("{:<8}{:<11}{:<18}{:<42}{}\n".format(
+                "PORT", "STATE", "SERVICE", "BANNER", "REASON"
+            ))
+            for result in target_document["results"]:
+                report.write("{:<8}{:<11}{:<18}{:<42}{}\n".format(
+                    result["port"], result["state"], result["service"],
+                    result["banner"], result["reason"]
+                ))
+            report.write("\n")
+
+
+def write_batch_csv_report(path, document):
+    fieldnames = [
+        "scanner_version", "batch_status", "target_index", "targets_requested",
+        "target", "expanded_from", "resolved_ip", "address_family",
+        "scan_type", "scan_status", "started_at", "duration_seconds",
+        "profile", "port", "state", "service", "banner", "reason",
+    ]
+    with open(path, "w", encoding="utf-8", newline="") as report:
+        writer = csv.DictWriter(report, fieldnames=fieldnames)
+        writer.writeheader()
+        for index, target_document in enumerate(document["targets"], start=1):
+            target = target_document["target"]
+            scan = target_document["scan"]
+            common = {
+                "scanner_version": SCANNER_VERSION,
+                "batch_status": document["batch"]["status"],
+                "target_index": index,
+                "targets_requested": document["batch"]["targets_requested"],
+                "target": target["input"],
+                "expanded_from": target.get("expanded_from") or "",
+                "resolved_ip": target["resolved_ip"],
+                "address_family": target["address_family"],
+                "scan_type": scan["type"],
+                "scan_status": scan["status"],
+                "started_at": scan["started_at"],
+                "duration_seconds": scan["duration_seconds"],
+                "profile": scan["profile"],
+            }
+            for result in target_document["results"]:
+                writer.writerow({**common, **normalized_result(result)})
+
+
+def write_batch_report(
+    path,
+    target_runs,
+    scan_type,
+    started_at,
+    finished_at,
+    elapsed,
+    ports_per_target,
+    targets_requested,
+    planned_probes,
+    output_format="auto",
+    open_only=False,
+    profile=DEFAULT_PROFILE,
+    effective_settings=None,
+    profile_overrides=None,
+    status="completed",
+):
+    """Write one report containing all target results."""
+    resolved_format = resolve_output_format(path, output_format)
+    document = build_batch_report_document(
+        target_runs,
+        scan_type,
+        started_at,
+        finished_at,
+        elapsed,
+        ports_per_target,
+        targets_requested,
+        planned_probes,
+        open_only=open_only,
+        profile=profile,
+        effective_settings=effective_settings,
+        profile_overrides=profile_overrides,
+        status=status,
+    )
+    writers = {
+        "json": write_batch_json_report,
+        "text": write_batch_text_report,
+        "csv": write_batch_csv_report,
+    }
+    writers[resolved_format](path, document)
+    return resolved_format, int(document["batch"]["results_written"])
+
+
+def print_batch_summary(target_runs, targets_requested, planned_probes, status):
+    """Print a concise aggregate summary after a multi-target scan."""
+    counts = aggregate_state_counts(target_runs)
+    completed_probes = sum(len(run.get("results", [])) for run in target_runs)
+    completed_targets = sum(1 for run in target_runs if run["status"] == "completed")
+    print("\n" + "#" * 76)
+    print("  Multi-target summary")
+    print("  Status   : {}".format(status))
+    print("  Targets  : {}/{} completed ({} started)".format(
+        completed_targets, targets_requested, len(target_runs)
+    ))
+    print("  Probes   : {}/{} completed".format(completed_probes, planned_probes))
+    print("  Summary  : {}".format(summary_text(counts)))
+    print("#" * 76 + "\n")
+
 # ---------------------------------------------------------------------------
 # Command-line interface
 # ---------------------------------------------------------------------------
@@ -1741,16 +2124,14 @@ def write_report(
 
 EPILOG = """Examples:
   portscan 192.168.1.10 -p 1-1024
-  portscan ::1 -p 22,80,443
+  portscan 192.168.1.10 192.168.1.20 -p 22,80,443
+  portscan 192.168.1.0/28 -p 22,80,443
+  portscan --targets-file targets.txt -p 1-1024
   portscan example.com -6 -p 22,80,443
   portscan 192.168.1.10 --profile fast
-  portscan example.com --profile reliable --timeout 2
-  sudo .venv/bin/portscan 192.168.1.10 --syn --profile reliable
-  portscan example.com -p 22,80,443 --show-all
-  portscan example.com -p 443,8443 --banner-threads 5
-  portscan 192.168.1.10 -p 1-65535 -o partial-or-complete.json
-  portscan 192.168.1.10 -o report.csv --report-open-only
-  portscan 192.168.1.10 -o results.data --output-format json
+  sudo .venv/bin/portscan 192.168.1.0/29 --syn --profile reliable
+  portscan 192.168.1.0/24 -p 80 --max-targets 254
+  portscan 192.168.1.0/24 -p 1-1024 -o subnet.json
 """
 
 
@@ -1863,7 +2244,29 @@ def build_parser():
         version="%(prog)s {}".format(SCANNER_VERSION),
     )
     parser.add_argument(
-        "target", help="Target IPv4/IPv6 address or hostname"
+        "target",
+        nargs="*",
+        metavar="TARGET",
+        help="IPv4/IPv6 address, hostname, or CIDR range",
+    )
+    parser.add_argument(
+        "--targets-file",
+        action="append",
+        default=[],
+        metavar="FILE",
+        help="Read targets/CIDRs from FILE; may be supplied more than once",
+    )
+    parser.add_argument(
+        "--max-targets",
+        type=positive_int,
+        default=DEFAULT_MAX_TARGETS,
+        help="Maximum expanded unique targets (default: 256)",
+    )
+    parser.add_argument(
+        "--max-probes",
+        type=positive_int,
+        default=DEFAULT_MAX_PROBES,
+        help="Maximum target-port combinations (default: 1000000)",
     )
     family_group = parser.add_mutually_exclusive_group()
     family_group.add_argument(
@@ -1943,38 +2346,25 @@ def build_parser():
     return parser
 
 
-def main():
-    parser = build_parser()
-    args = parser.parse_args()
+def scan_one_target(
+    target_entry,
+    ports,
+    args,
+    effective_settings,
+    profile_overrides,
+    scan_type,
+    target_index=1,
+    target_total=1,
+):
+    """Run one target and return a reportable result bundle."""
+    target = target_entry["input"]
+    ip = target_entry["resolved_ip"]
 
-    if not args.output and args.output_format != "auto":
-        parser.error("--output-format requires --output")
-    if not args.output and args.report_open_only:
-        parser.error("--report-open-only requires --output")
-
-    try:
-        effective_settings, profile_overrides = resolve_scan_settings(args)
-    except ValueError as exc:
-        parser.error(str(exc))
-
-    family_preference = "ipv6" if args.ipv6 else "ipv4" if args.ipv4 else "auto"
-    try:
-        if family_preference == "auto":
-            # Keep one-argument monkeypatches and third-party callers compatible.
-            ip = resolve_target(args.target)
-        else:
-            ip = resolve_target(args.target, family=family_preference)
-        ports = parse_ports(args.ports)
-    except ValueError as exc:
-        parser.error(str(exc))
-
-    scan_type = (
-        "SYN scan (Scapy, batched)"
-        if args.syn
-        else "TCP connect scan (socket)"
-    )
-
-    print("\nTarget: {} ({})".format(args.target, ip))
+    if target_total > 1:
+        print("\n--- Target {}/{} ---".format(target_index, target_total))
+    print("\nTarget: {} ({})".format(target, ip))
+    if target_entry.get("expanded_from"):
+        print("Source: {}".format(target_entry["expanded_from"]))
     print("Family: {}".format(address_family_name(ip)))
     print("Ports : {}".format(len(ports)))
     print("Mode  : {}".format(scan_type))
@@ -2015,7 +2405,7 @@ def main():
 
         if not args.no_banner:
             identify_open_services(
-                args.target,
+                target,
                 ip,
                 results,
                 effective_settings["timeout"],
@@ -2030,15 +2420,10 @@ def main():
         stage_completed = exc.stage_completed
         stage_total = exc.stage_total
     except KeyboardInterrupt:
-        # Defensive fallback for an interruption outside an engine-specific
-        # handler. Results already assigned in main are still reportable.
         status = "interrupted"
         interrupted_stage = "scan"
         stage_completed = len(results)
         stage_total = len(ports)
-    except (RuntimeError, PermissionError, OSError) as exc:
-        print("Error: {}".format(exc), file=sys.stderr)
-        return 1
 
     elapsed = time.perf_counter() - started
     scan_finished_at = datetime.now().astimezone()
@@ -2046,18 +2431,16 @@ def main():
     if status == "interrupted":
         completed, requested, percent = report_progress(results, len(ports))
         print("\nScan interrupted during {}.".format(interrupted_stage or "scan"))
-        print(
-            "Preserved {}/{} port result(s) ({:.2f}%).".format(
-                completed, requested, percent
-            )
-        )
+        print("Preserved {}/{} port result(s) ({:.2f}%).".format(
+            completed, requested, percent
+        ))
         if stage_total is not None:
             print("Stage progress: {}/{}.".format(
                 int(stage_completed or 0), int(stage_total)
             ))
 
     print_results(
-        args.target,
+        target,
         ip,
         results,
         elapsed,
@@ -2068,47 +2451,168 @@ def main():
         ports_requested=len(ports),
     )
 
+    return {
+        "target": target,
+        "ip": ip,
+        "expanded_from": target_entry.get("expanded_from"),
+        "results": results,
+        "elapsed": elapsed,
+        "started_at": scan_started_at,
+        "finished_at": scan_finished_at,
+        "status": status,
+        "interrupted_stage": interrupted_stage,
+        "stage_completed": stage_completed,
+        "stage_total": stage_total,
+    }
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if not args.output and args.output_format != "auto":
+        parser.error("--output-format requires --output")
+    if not args.output and args.report_open_only:
+        parser.error("--report-open-only requires --output")
+
+    try:
+        effective_settings, profile_overrides = resolve_scan_settings(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    family_preference = "ipv6" if args.ipv6 else "ipv4" if args.ipv4 else "auto"
+    try:
+        ports = parse_ports(args.ports)
+        targets = collect_targets(
+            args.target,
+            target_files=args.targets_file,
+            family=family_preference,
+            max_targets=args.max_targets,
+        )
+        planned_probes = validate_probe_plan(
+            len(targets), len(ports), args.max_probes
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    scan_type = (
+        "SYN scan (Scapy, batched)" if args.syn else "TCP connect scan (socket)"
+    )
+
+    if len(targets) > 1:
+        print("\nTargets: {} unique host(s)".format(len(targets)))
+        print("Plan   : {:,} target-port probe(s)".format(planned_probes))
+        print("Order  : sequential targets; concurrent ports per target")
+
+    batch_started_at = datetime.now().astimezone()
+    batch_started = time.perf_counter()
+    target_runs = []
+    batch_status = "completed"
+
+    for index, target_entry in enumerate(targets, start=1):
+        try:
+            run = scan_one_target(
+                target_entry,
+                ports,
+                args,
+                effective_settings,
+                profile_overrides,
+                scan_type,
+                target_index=index,
+                target_total=len(targets),
+            )
+        except KeyboardInterrupt:
+            batch_status = "interrupted"
+            break
+        except (RuntimeError, PermissionError, OSError) as exc:
+            print("Error scanning {}: {}".format(
+                target_entry["resolved_ip"], exc
+            ), file=sys.stderr)
+            return 1
+        target_runs.append(run)
+        if run["status"] == "interrupted":
+            batch_status = "interrupted"
+            break
+
+    if batch_status == "interrupted" and not target_runs:
+        now = datetime.now().astimezone()
+        target_entry = targets[0]
+        target_runs.append({
+            "target": target_entry["input"],
+            "ip": target_entry["resolved_ip"],
+            "expanded_from": target_entry.get("expanded_from"),
+            "results": [],
+            "elapsed": 0.0,
+            "started_at": now,
+            "finished_at": now,
+            "status": "interrupted",
+            "interrupted_stage": "batch orchestration",
+            "stage_completed": 0,
+            "stage_total": len(ports),
+        })
+
+    batch_elapsed = time.perf_counter() - batch_started
+    batch_finished_at = datetime.now().astimezone()
+
+    if len(targets) > 1:
+        print_batch_summary(
+            target_runs, len(targets), planned_probes, batch_status
+        )
+
     if args.output:
         try:
-            resolved_format, rows_written = write_report(
-                args.output,
-                args.target,
-                ip,
-                results,
-                elapsed,
-                scan_type,
-                scan_started_at,
-                scan_finished_at,
-                output_format=args.output_format,
-                open_only=args.report_open_only,
-                profile=args.profile,
-                effective_settings=effective_settings,
-                profile_overrides=profile_overrides,
-                status=status,
-                interrupted_stage=interrupted_stage,
-                ports_requested=len(ports),
-                stage_completed=stage_completed,
-                stage_total=stage_total,
-            )
-            scope = "open ports" if args.report_open_only else "all states"
-            report_kind = "Partial report" if status == "interrupted" else "Report"
-            print(
-                "{} written to {} ({}; {} row(s); {})".format(
-                    report_kind,
+            if len(targets) == 1:
+                run = target_runs[0]
+                resolved_format, rows_written = write_report(
                     args.output,
-                    resolved_format.upper(),
-                    rows_written,
-                    scope,
+                    run["target"],
+                    run["ip"],
+                    run["results"],
+                    run["elapsed"],
+                    scan_type,
+                    run["started_at"],
+                    run["finished_at"],
+                    output_format=args.output_format,
+                    open_only=args.report_open_only,
+                    profile=args.profile,
+                    effective_settings=effective_settings,
+                    profile_overrides=profile_overrides,
+                    status=run["status"],
+                    interrupted_stage=run["interrupted_stage"],
+                    ports_requested=len(ports),
+                    stage_completed=run["stage_completed"],
+                    stage_total=run["stage_total"],
                 )
-            )
+            else:
+                resolved_format, rows_written = write_batch_report(
+                    args.output,
+                    target_runs,
+                    scan_type,
+                    batch_started_at,
+                    batch_finished_at,
+                    batch_elapsed,
+                    len(ports),
+                    len(targets),
+                    planned_probes,
+                    output_format=args.output_format,
+                    open_only=args.report_open_only,
+                    profile=args.profile,
+                    effective_settings=effective_settings,
+                    profile_overrides=profile_overrides,
+                    status=batch_status,
+                )
+            scope = "open ports" if args.report_open_only else "all states"
+            report_kind = "Partial report" if batch_status == "interrupted" else "Report"
+            print("{} written to {} ({}; {} row(s); {})".format(
+                report_kind, args.output, resolved_format.upper(), rows_written, scope
+            ))
         except OSError as exc:
             print("Error writing report: {}".format(exc), file=sys.stderr)
             return 1
-    elif status == "interrupted":
+    elif batch_status == "interrupted":
         print("No partial report saved. Use -o FILE on the next scan to save one.")
 
-    return 130 if status == "interrupted" else 0
-
+    return 130 if batch_status == "interrupted" else 0
 
 def console_main():
     """Console-script entry point installed as ``portscan``."""

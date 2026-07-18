@@ -1,21 +1,9 @@
 # Testing
 
-Create and activate a virtual environment, then install the project and its
-development tools in editable mode:
+Install the package and development dependencies:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip
 python -m pip install -e ".[dev]"
-```
-
-Verify all three supported launch methods:
-
-```bash
-portscan --help
-python -m portscanner --help
-python port_scanner.py --help
 ```
 
 Run the complete suite:
@@ -24,7 +12,7 @@ Run the complete suite:
 python -m pytest tests -v
 ```
 
-Run coverage enforcement against the installed package:
+Run coverage enforcement:
 
 ```bash
 python -m pytest tests \
@@ -33,22 +21,23 @@ python -m pytest tests \
   --cov-fail-under=75
 ```
 
-Build the wheel and source distribution:
-
-```bash
-python -m build
-```
-
-The automated tests are network-free. IPv4/IPv6 resolution, socket endpoints,
-HTTP Host headers, TLS sessions, Scapy IPv4/IPv6 packet selection, ICMP/ICMPv6
-responses, thread-pool futures, interruptions, and report writers are mocked or
+The suite is network-free unless a test explicitly starts a local loopback
+service. Sockets, Scapy responses, TLS sessions, interruptions, target
+resolution, CIDR expansion, target files, and report writers are mocked or
 constructed locally.
 
-The v4.7 suite contains 151 tests and enforces at least 75% package coverage.
-A local manual IPv6 smoke test can be run without scanning another device:
+Important v5.0 coverage areas include:
 
-```bash
-python -m http.server 8765 --bind ::1
-# In another terminal:
-portscan ::1 -p 8765
-```
+- IPv4 and IPv6 target resolution.
+- Multiple positional targets and target files.
+- IPv4/IPv6 CIDR expansion and edge prefixes.
+- Target deduplication.
+- Target and probe safety limits.
+- Connect and SYN scan classification.
+- HTTP, TLS, certificate, and banner identification.
+- Scan profiles and explicit overrides.
+- Single-target and multi-target text/JSON/CSV reports.
+- Graceful Ctrl+C preservation.
+- Installed console, module, and legacy entry points.
+
+The v5.0 release suite contains 168 tests.

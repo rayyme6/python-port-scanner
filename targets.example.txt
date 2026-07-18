@@ -1,0 +1,7 @@
+# Copy this file to targets.local.txt and replace these documentation addresses
+# with systems you own or are explicitly authorized to scan.
+
+192.0.2.10
+198.51.100.0/30
+example.test
+2001:db8::10

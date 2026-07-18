@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "python-port-scanner"
 dynamic = ["version"]
-description = "Authorized IPv4/IPv6 TCP connect and SYN scanner with service identification and structured reports"
+description = "Authorized multi-target IPv4/IPv6 TCP connect and SYN scanner with CIDR support and structured reports"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

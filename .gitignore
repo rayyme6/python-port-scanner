@@ -57,3 +57,12 @@ Thumbs.db
 
 # Generated IPv6 scan reports
 ipv6-scan.*
+
+# Local target inventories
+targets.local.txt
+targets.*.local.txt
+
+# Generated multi-target scan reports
+batch-scan.*
+ipv6-scan.*
+interrupted-subnet.*
