@@ -44,7 +44,7 @@ except ImportError:
 
 
 SCANNER_NAME = "python-port-scanner"
-SCANNER_VERSION = "4.4"
+SCANNER_VERSION = "4.5"
 REPORT_FORMATS = ("auto", "text", "json", "csv")
 
 DEFAULT_PROFILE = "balanced"
@@ -72,6 +72,30 @@ SCAN_PROFILES = {
         "retries": 2,
     },
 }
+
+
+class ScanInterrupted(KeyboardInterrupt):
+    """Carry safely collected results when a user interrupts a scan stage."""
+
+    def __init__(
+        self,
+        results=None,
+        stage="scan",
+        stage_completed=None,
+        stage_total=None,
+    ):
+        super().__init__()
+        self.results = sorted(
+            list(results or []),
+            key=lambda result: int(result.get("port", 0)),
+        )
+        self.stage = str(stage)
+        self.stage_completed = int(
+            len(self.results) if stage_completed is None else stage_completed
+        )
+        self.stage_total = int(
+            self.stage_completed if stage_total is None else stage_total
+        )
 
 
 # Conventional service labels. These are fallbacks, not definitive proof of
@@ -596,6 +620,16 @@ def identify_service(target, ip, port, timeout):
     return service, ""
 
 
+def _service_future_result(future, result):
+    """Apply one completed service-identification future to its result row."""
+    try:
+        service, banner = future.result()
+        result["service"] = service
+        result["banner"] = banner
+    except Exception as exc:
+        result["banner"] = "identification error: {}".format(exc)
+
+
 def identify_open_services(
     target,
     ip,
@@ -604,41 +638,77 @@ def identify_open_services(
     max_workers=10,
     progress=True,
 ):
-    """Identify open services concurrently without changing scan states."""
+    """Identify open services concurrently and preserve work on Ctrl+C."""
     open_results = [result for result in results if result["state"] == "open"]
     if not open_results:
         return
 
     worker_count = min(max_workers, len(open_results))
-    with ThreadPoolExecutor(max_workers=worker_count) as pool:
-        future_to_result = {
-            pool.submit(
+    pool = ThreadPoolExecutor(max_workers=worker_count)
+    future_to_result = {}
+    processed = set()
+    completed_count = 0
+
+    try:
+        for result in open_results:
+            future = pool.submit(
                 identify_service,
                 target,
                 ip,
                 result["port"],
                 timeout,
-            ): result
-            for result in open_results
-        }
+            )
+            future_to_result[future] = result
 
-        for completed, future in enumerate(as_completed(future_to_result), start=1):
-            result = future_to_result[future]
-            try:
-                service, banner = future.result()
-                result["service"] = service
-                result["banner"] = banner
-            except Exception as exc:
-                result["banner"] = "identification error: {}".format(exc)
+        for future in as_completed(future_to_result):
+            processed.add(future)
+            _service_future_result(future, future_to_result[future])
+            completed_count += 1
 
             if progress and len(open_results) > 1:
                 print(
                     "\r  identified {}/{} open service(s)...".format(
-                        completed, len(open_results)
+                        completed_count, len(open_results)
                     ),
                     end="",
                     flush=True,
                 )
+
+    except KeyboardInterrupt:
+        # Preserve any futures that completed just before the interrupt but were
+        # not yet yielded by as_completed().
+        for future, result in future_to_result.items():
+            if future in processed or future.cancelled() or not future.done():
+                continue
+            processed.add(future)
+            _service_future_result(future, result)
+            completed_count += 1
+
+        for future in future_to_result:
+            if not future.done():
+                future.cancel()
+        pool.shutdown(wait=False, cancel_futures=True)
+
+        if progress and len(open_results) > 1:
+            print(
+                "\r  service identification interrupted after {}/{}.{}".format(
+                    completed_count, len(open_results), " " * 12
+                )
+            )
+        raise ScanInterrupted(
+            results,
+            stage="service identification",
+            stage_completed=completed_count,
+            stage_total=len(open_results),
+        )
+    except BaseException:
+        for future in future_to_result:
+            if not future.done():
+                future.cancel()
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        pool.shutdown(wait=True)
 
     if progress and len(open_results) > 1:
         print(
@@ -720,6 +790,14 @@ def _connect_probe(ip, port, timeout, retries=1):
     return make_result(port, "error", "probe failed: {}".format(last_error))
 
 
+def _connect_future_result(future, port):
+    """Convert a completed connect-scan future into a stable result row."""
+    try:
+        return future.result()
+    except Exception as exc:
+        return make_result(port, "error", "probe failed: {}".format(exc))
+
+
 def tcp_connect_scan(
     ip,
     ports,
@@ -728,25 +806,24 @@ def tcp_connect_scan(
     retries=1,
     progress=True,
 ):
-    """Scan TCP ports concurrently using normal operating-system sockets."""
+    """Scan TCP ports concurrently and preserve completed rows on Ctrl+C."""
     results = []
     total = len(ports)
+    pool = ThreadPoolExecutor(max_workers=max_threads)
+    future_to_port = {}
+    processed = set()
 
-    with ThreadPoolExecutor(max_workers=max_threads) as pool:
-        future_to_port = {
-            pool.submit(_connect_probe, ip, port, timeout, retries): port
-            for port in ports
-        }
+    try:
+        for port in ports:
+            future = pool.submit(_connect_probe, ip, port, timeout, retries)
+            future_to_port[future] = port
 
-        for completed, future in enumerate(as_completed(future_to_port), start=1):
-            port = future_to_port[future]
-
-            try:
-                results.append(future.result())
-            except Exception as exc:
-                results.append(
-                    make_result(port, "error", "probe failed: {}".format(exc))
-                )
+        for future in as_completed(future_to_port):
+            processed.add(future)
+            results.append(
+                _connect_future_result(future, future_to_port[future])
+            )
+            completed = len(results)
 
             if progress and (completed % 50 == 0 or completed == total):
                 print(
@@ -754,6 +831,42 @@ def tcp_connect_scan(
                     end="",
                     flush=True,
                 )
+
+    except KeyboardInterrupt:
+        # Some futures may have completed between the last as_completed() yield
+        # and Ctrl+C. Keep those rows before cancelling queued work.
+        for future, port in future_to_port.items():
+            if future in processed or future.cancelled() or not future.done():
+                continue
+            processed.add(future)
+            results.append(_connect_future_result(future, port))
+
+        for future in future_to_port:
+            if not future.done():
+                future.cancel()
+        pool.shutdown(wait=False, cancel_futures=True)
+
+        results.sort(key=lambda result: result["port"])
+        if progress:
+            print(
+                "\r  scan interrupted after {}/{} completed port(s).{}".format(
+                    len(results), total, " " * 12
+                )
+            )
+        raise ScanInterrupted(
+            results,
+            stage="TCP connect scan",
+            stage_completed=len(results),
+            stage_total=total,
+        )
+    except BaseException:
+        for future in future_to_port:
+            if not future.done():
+                future.cancel()
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    else:
+        pool.shutdown(wait=True)
 
     if progress:
         print("\r  scanned {}/{} ports.{}".format(total, total, " " * 15))
@@ -830,7 +943,7 @@ def syn_scan(
     A large burst can make routers, access points, or the local Wi-Fi path drop
     replies. Unanswered ports are therefore retried in progressively smaller,
     slower batches. A port is marked filtered only after every attempt fails to
-    obtain a response.
+    obtain a response. Ctrl+C preserves every response classified so far.
     """
     if not SCAPY_AVAILABLE:
         raise RuntimeError(
@@ -850,75 +963,90 @@ def syn_scan(
     total = len(ports)
     total_replies = 0
 
-    for attempt in range(retries + 1):
-        if not pending_ports:
-            break
+    try:
+        for attempt in range(retries + 1):
+            if not pending_ports:
+                break
 
-        attempt_batch_size = max(32, batch_size // (2**attempt))
-        attempt_inter = inter * (2**attempt)
-        attempt_timeout = timeout * (1.0 + 0.5 * attempt)
-        unanswered_ports = []
-        attempted_this_round = 0
+            attempt_batch_size = max(32, batch_size // (2**attempt))
+            attempt_inter = inter * (2**attempt)
+            attempt_timeout = timeout * (1.0 + 0.5 * attempt)
+            unanswered_ports = []
+            attempted_this_round = 0
 
-        if progress and attempt > 0:
-            print(
-                "  retry {}/{}: {} unanswered port(s)".format(
-                    attempt, retries, len(pending_ports)
+            if progress and attempt > 0:
+                print(
+                    "  retry {}/{}: {} unanswered port(s)".format(
+                        attempt, retries, len(pending_ports)
+                    )
                 )
-            )
 
-        for port_batch in chunked(pending_ports, attempt_batch_size):
-            packets = build_syn_packets(ip, port_batch)
+            for port_batch in chunked(pending_ports, attempt_batch_size):
+                packets = build_syn_packets(ip, port_batch)
 
-            answered, unanswered = sr(
-                packets,
-                timeout=attempt_timeout,
-                retry=0,
-                inter=attempt_inter,
-                verbose=0,
-                threaded=True,
-            )
+                answered, unanswered = sr(
+                    packets,
+                    timeout=attempt_timeout,
+                    retry=0,
+                    inter=attempt_inter,
+                    verbose=0,
+                    threaded=True,
+                )
 
-            total_replies += len(answered)
-            reset_packets = []
+                total_replies += len(answered)
+                reset_packets = []
 
-            for sent_packet, response in answered:
-                port = int(sent_packet[TCP].dport)
-                state, reason = classify_syn_response(response)
+                for sent_packet, response in answered:
+                    port = int(sent_packet[TCP].dport)
+                    state, reason = classify_syn_response(response)
+                    results_by_port[port] = make_result(port, state, reason)
 
-                # Any actual response is stronger evidence than an earlier
-                # no-response result, so it replaces the pending status.
-                results_by_port[port] = make_result(port, state, reason)
-
-                if state == "open" and response.haslayer(TCP):
-                    reset_packets.append(
-                        IP(dst=ip)
-                        / TCP(
-                            sport=int(sent_packet[TCP].sport),
-                            dport=port,
-                            flags="R",
-                            seq=int(response[TCP].ack),
+                    if state == "open" and response.haslayer(TCP):
+                        reset_packets.append(
+                            IP(dst=ip)
+                            / TCP(
+                                sport=int(sent_packet[TCP].sport),
+                                dport=port,
+                                flags="R",
+                                seq=int(response[TCP].ack),
+                            )
                         )
+
+                if reset_packets:
+                    send(reset_packets, verbose=0)
+
+                unanswered_ports.extend(
+                    int(sent_packet[TCP].dport) for sent_packet in unanswered
+                )
+                attempted_this_round += len(port_batch)
+
+                if progress and attempt == 0:
+                    print(
+                        "\r  scanned {}/{} ports...".format(
+                            attempted_this_round, total
+                        ),
+                        end="",
+                        flush=True,
                     )
 
-            if reset_packets:
-                send(reset_packets, verbose=0)
+            pending_ports = sorted(set(unanswered_ports))
 
-            unanswered_ports.extend(
-                int(sent_packet[TCP].dport) for sent_packet in unanswered
-            )
-            attempted_this_round += len(port_batch)
-
-            if progress and attempt == 0:
-                print(
-                    "\r  scanned {}/{} ports...".format(
-                        attempted_this_round, total
-                    ),
-                    end="",
-                    flush=True,
+    except KeyboardInterrupt:
+        partial_results = [
+            results_by_port[port] for port in sorted(results_by_port)
+        ]
+        if progress:
+            print(
+                "\r  SYN scan interrupted after {}/{} classified port(s).{}".format(
+                    len(partial_results), total, " " * 12
                 )
-
-        pending_ports = sorted(set(unanswered_ports))
+            )
+        raise ScanInterrupted(
+            partial_results,
+            stage="SYN scan",
+            stage_completed=len(partial_results),
+            stage_total=total,
+        )
 
     if progress:
         print("\r  scanned {}/{} ports.{}".format(total, total, " " * 15))
@@ -1031,6 +1159,17 @@ def resolve_output_format(path, requested_format="auto"):
     }.get(extension, "text")
 
 
+def report_progress(results, ports_requested=None):
+    """Return completed/requested counts and a bounded completion percentage."""
+    completed = len(results)
+    requested = completed if ports_requested is None else max(0, int(ports_requested))
+    if requested == 0:
+        percent = 100.0 if completed == 0 else 0.0
+    else:
+        percent = min(100.0, (completed / requested) * 100.0)
+    return completed, requested, round(percent, 4)
+
+
 def build_report_document(
     target,
     ip,
@@ -1043,10 +1182,23 @@ def build_report_document(
     profile=DEFAULT_PROFILE,
     effective_settings=None,
     profile_overrides=None,
+    status="completed",
+    interrupted_stage=None,
+    ports_requested=None,
+    stage_completed=None,
+    stage_total=None,
 ):
     """Build the structured document used by JSON reports."""
     report_results = select_report_results(results, open_only)
     counts = get_state_counts(results)
+    completed, requested, percent = report_progress(results, ports_requested)
+    stage_progress = None
+    if stage_completed is not None or stage_total is not None:
+        stage_progress = {
+            "completed": int(stage_completed or 0),
+            "total": int(stage_total or 0),
+        }
+
     return {
         "scanner": {
             "name": SCANNER_NAME,
@@ -1058,10 +1210,17 @@ def build_report_document(
         },
         "scan": {
             "type": scan_type,
+            "status": status,
+            "interrupted": status == "interrupted",
+            "interrupted_stage": interrupted_stage,
             "started_at": started_at.isoformat(timespec="seconds"),
             "finished_at": finished_at.isoformat(timespec="seconds"),
             "duration_seconds": round(float(elapsed), 6),
-            "ports_scanned": len(results),
+            "ports_scanned": completed,
+            "ports_requested": requested,
+            "ports_completed": completed,
+            "completion_percent": percent,
+            "stage_progress": stage_progress,
             "report_scope": "open-only" if open_only else "all-states",
             "results_written": len(report_results),
             "profile": profile,
@@ -1073,14 +1232,32 @@ def build_report_document(
     }
 
 
-def print_results(target, ip, results, elapsed, scan_type, show_all=False):
+def print_results(
+    target,
+    ip,
+    results,
+    elapsed,
+    scan_type,
+    show_all=False,
+    status="completed",
+    interrupted_stage=None,
+    ports_requested=None,
+):
     displayed = select_results(results, show_all)
     counts = get_state_counts(results)
+    completed, requested, percent = report_progress(results, ports_requested)
 
     print()
     print("=" * 76)
     print("  Scan report for {} ({})".format(target, ip))
     print("  Scan type : {}".format(scan_type))
+    if status != "completed":
+        print("  Status    : {} during {}".format(
+            status, interrupted_stage or "scan"
+        ))
+        print("  Progress  : {}/{} port result(s) ({:.2f}%)".format(
+            completed, requested, percent
+        ))
     print("  Duration  : {:.2f}s".format(elapsed))
     print("  Summary   : {}".format(summary_text(counts)))
     print("=" * 76)
@@ -1089,7 +1266,7 @@ def print_results(target, ip, results, elapsed, scan_type, show_all=False):
         if show_all:
             print("\n  No results were produced.\n")
         else:
-            print("\n  No open ports found in the requested range.\n")
+            print("\n  No open ports found in the completed results.\n")
         return
 
     print("\n  {:<8}{:<11}{:<18}{}".format(
@@ -1129,15 +1306,31 @@ def write_text_report(
     profile=DEFAULT_PROFILE,
     effective_settings=None,
     profile_overrides=None,
+    status="completed",
+    interrupted_stage=None,
+    ports_requested=None,
+    stage_completed=None,
+    stage_total=None,
 ):
     report_results = select_report_results(results, open_only)
     counts = get_state_counts(results)
+    completed, requested, percent = report_progress(results, ports_requested)
 
     with open(path, "w", encoding="utf-8") as report:
         report.write("Port scan report\n")
         report.write("Scanner   : {} {}\n".format(SCANNER_NAME, SCANNER_VERSION))
         report.write("Target    : {} ({})\n".format(target, ip))
         report.write("Scan type : {}\n".format(scan_type))
+        report.write("Status    : {}\n".format(status))
+        if interrupted_stage:
+            report.write("Interrupted: {}\n".format(interrupted_stage))
+        report.write("Progress  : {}/{} port result(s) ({:.2f}%)\n".format(
+            completed, requested, percent
+        ))
+        if stage_completed is not None or stage_total is not None:
+            report.write("Stage     : {}/{} completed\n".format(
+                int(stage_completed or 0), int(stage_total or 0)
+            ))
         report.write("Profile   : {}\n".format(profile))
         report.write("Overrides : {}\n".format(
             ", ".join(profile_overrides or []) or "none"
@@ -1160,7 +1353,7 @@ def write_text_report(
             finished_at.isoformat(timespec="seconds")
         ))
         report.write("Duration  : {:.6f}s\n".format(elapsed))
-        report.write("Ports     : {} scanned\n".format(len(results)))
+        report.write("Ports     : {} of {} completed\n".format(completed, requested))
         report.write("Scope     : {}\n".format(
             "open ports only" if open_only else "all states"
         ))
@@ -1193,6 +1386,11 @@ def write_json_report(
     profile=DEFAULT_PROFILE,
     effective_settings=None,
     profile_overrides=None,
+    status="completed",
+    interrupted_stage=None,
+    ports_requested=None,
+    stage_completed=None,
+    stage_total=None,
 ):
     document = build_report_document(
         target,
@@ -1206,6 +1404,11 @@ def write_json_report(
         profile=profile,
         effective_settings=effective_settings,
         profile_overrides=profile_overrides,
+        status=status,
+        interrupted_stage=interrupted_stage,
+        ports_requested=ports_requested,
+        stage_completed=stage_completed,
+        stage_total=stage_total,
     )
     with open(path, "w", encoding="utf-8") as report:
         json.dump(document, report, indent=2, ensure_ascii=False)
@@ -1225,13 +1428,26 @@ def write_csv_report(
     profile=DEFAULT_PROFILE,
     effective_settings=None,
     profile_overrides=None,
+    status="completed",
+    interrupted_stage=None,
+    ports_requested=None,
+    stage_completed=None,
+    stage_total=None,
 ):
     report_results = select_report_results(results, open_only)
+    completed, requested, percent = report_progress(results, ports_requested)
     fieldnames = [
         "scanner_version",
         "target",
         "resolved_ip",
         "scan_type",
+        "scan_status",
+        "interrupted_stage",
+        "ports_requested",
+        "ports_completed",
+        "completion_percent",
+        "stage_completed",
+        "stage_total",
         "started_at",
         "duration_seconds",
         "profile",
@@ -1249,24 +1465,30 @@ def write_csv_report(
     ]
 
     settings = normalized_scan_settings(effective_settings)
+    common = {
+        "scanner_version": SCANNER_VERSION,
+        "target": target,
+        "resolved_ip": ip,
+        "scan_type": scan_type,
+        "scan_status": status,
+        "interrupted_stage": interrupted_stage or "",
+        "ports_requested": requested,
+        "ports_completed": completed,
+        "completion_percent": "{:.4f}".format(percent),
+        "stage_completed": "" if stage_completed is None else int(stage_completed),
+        "stage_total": "" if stage_total is None else int(stage_total),
+        "started_at": started_at.isoformat(timespec="seconds"),
+        "duration_seconds": "{:.6f}".format(elapsed),
+        "profile": profile,
+        "profile_overrides": ",".join(profile_overrides or []),
+        **settings,
+    }
 
     with open(path, "w", encoding="utf-8", newline="") as report:
         writer = csv.DictWriter(report, fieldnames=fieldnames)
         writer.writeheader()
         for result in report_results:
-            normalized = normalized_result(result)
-            writer.writerow({
-                "scanner_version": SCANNER_VERSION,
-                "target": target,
-                "resolved_ip": ip,
-                "scan_type": scan_type,
-                "started_at": started_at.isoformat(timespec="seconds"),
-                "duration_seconds": "{:.6f}".format(elapsed),
-                "profile": profile,
-                "profile_overrides": ",".join(profile_overrides or []),
-                **settings,
-                **normalized,
-            })
+            writer.writerow({**common, **normalized_result(result)})
 
 
 def write_report(
@@ -1283,8 +1505,13 @@ def write_report(
     profile=DEFAULT_PROFILE,
     effective_settings=None,
     profile_overrides=None,
+    status="completed",
+    interrupted_stage=None,
+    ports_requested=None,
+    stage_completed=None,
+    stage_total=None,
 ):
-    """Write text, JSON, or CSV and return the resolved format and row count."""
+    """Write a complete or partial report and return format and row count."""
     resolved_format = resolve_output_format(path, output_format)
     writers = {
         "text": write_text_report,
@@ -1304,6 +1531,11 @@ def write_report(
         profile=profile,
         effective_settings=effective_settings,
         profile_overrides=profile_overrides,
+        status=status,
+        interrupted_stage=interrupted_stage,
+        ports_requested=ports_requested,
+        stage_completed=stage_completed,
+        stage_total=stage_total,
     )
     return resolved_format, len(select_report_results(results, open_only))
 
@@ -1320,7 +1552,7 @@ EPILOG = """Examples:
   sudo .venv/bin/python port_scanner.py 192.168.1.10 --syn --profile reliable
   python3 port_scanner.py example.com -p 22,80,443 --show-all
   python3 port_scanner.py example.com -p 443,8443 --banner-threads 5
-  python3 port_scanner.py 192.168.1.10 -o report.json
+  python3 port_scanner.py 192.168.1.10 -p 1-65535 -o partial-or-complete.json
   python3 port_scanner.py 192.168.1.10 -o report.csv --report-open-only
   python3 port_scanner.py 192.168.1.10 -o results.data --output-format json
 """
@@ -1482,7 +1714,7 @@ def build_parser():
     )
     parser.add_argument(
         "-o", "--output", metavar="FILE",
-        help="Write a report; .json and .csv select structured formats",
+        help="Write a complete report, or partial results after Ctrl+C",
     )
     parser.add_argument(
         "--output-format",
@@ -1519,11 +1751,15 @@ def main():
     except ValueError as exc:
         parser.error(str(exc))
 
+    scan_type = (
+        "SYN scan (Scapy, batched)"
+        if args.syn
+        else "TCP connect scan (socket)"
+    )
+
     print("\nTarget: {} ({})".format(args.target, ip))
     print("Ports : {}".format(len(ports)))
-    print("Mode  : {}".format(
-        "SYN scan (Scapy, batched)" if args.syn else "TCP connect scan (socket)"
-    ))
+    print("Mode  : {}".format(scan_type))
     override_text = ", ".join(profile_overrides) or "none"
     print("Profile: {} (overrides: {})".format(args.profile, override_text))
     print("Tuning : {}\n".format(
@@ -1532,6 +1768,11 @@ def main():
 
     scan_started_at = datetime.now().astimezone()
     started = time.perf_counter()
+    results = []
+    status = "completed"
+    interrupted_stage = None
+    stage_completed = None
+    stage_total = None
 
     try:
         if args.syn:
@@ -1544,7 +1785,6 @@ def main():
                 inter=effective_settings["inter"],
                 progress=not args.no_progress,
             )
-            scan_type = "SYN scan (Scapy, batched)"
         else:
             results = tcp_connect_scan(
                 ip,
@@ -1554,23 +1794,49 @@ def main():
                 retries=effective_settings["retries"],
                 progress=not args.no_progress,
             )
-            scan_type = "TCP connect scan (socket)"
+
+        if not args.no_banner:
+            identify_open_services(
+                args.target,
+                ip,
+                results,
+                effective_settings["timeout"],
+                max_workers=args.banner_threads,
+                progress=not args.no_progress,
+            )
+
+    except ScanInterrupted as exc:
+        results = exc.results
+        status = "interrupted"
+        interrupted_stage = exc.stage
+        stage_completed = exc.stage_completed
+        stage_total = exc.stage_total
+    except KeyboardInterrupt:
+        # Defensive fallback for an interruption outside an engine-specific
+        # handler. Results already assigned in main are still reportable.
+        status = "interrupted"
+        interrupted_stage = "scan"
+        stage_completed = len(results)
+        stage_total = len(ports)
     except (RuntimeError, PermissionError, OSError) as exc:
         print("Error: {}".format(exc), file=sys.stderr)
         return 1
 
-    if not args.no_banner:
-        identify_open_services(
-            args.target,
-            ip,
-            results,
-            effective_settings["timeout"],
-            max_workers=args.banner_threads,
-            progress=not args.no_progress,
-        )
-
     elapsed = time.perf_counter() - started
     scan_finished_at = datetime.now().astimezone()
+
+    if status == "interrupted":
+        completed, requested, percent = report_progress(results, len(ports))
+        print("\nScan interrupted during {}.".format(interrupted_stage or "scan"))
+        print(
+            "Preserved {}/{} port result(s) ({:.2f}%).".format(
+                completed, requested, percent
+            )
+        )
+        if stage_total is not None:
+            print("Stage progress: {}/{}.".format(
+                int(stage_completed or 0), int(stage_total)
+            ))
 
     print_results(
         args.target,
@@ -1579,6 +1845,9 @@ def main():
         elapsed,
         scan_type,
         show_all=args.show_all,
+        status=status,
+        interrupted_stage=interrupted_stage,
+        ports_requested=len(ports),
     )
 
     if args.output:
@@ -1597,18 +1866,30 @@ def main():
                 profile=args.profile,
                 effective_settings=effective_settings,
                 profile_overrides=profile_overrides,
+                status=status,
+                interrupted_stage=interrupted_stage,
+                ports_requested=len(ports),
+                stage_completed=stage_completed,
+                stage_total=stage_total,
             )
             scope = "open ports" if args.report_open_only else "all states"
+            report_kind = "Partial report" if status == "interrupted" else "Report"
             print(
-                "Report written to {} ({}; {} row(s); {})".format(
-                    args.output, resolved_format.upper(), rows_written, scope
+                "{} written to {} ({}; {} row(s); {})".format(
+                    report_kind,
+                    args.output,
+                    resolved_format.upper(),
+                    rows_written,
+                    scope,
                 )
             )
         except OSError as exc:
             print("Error writing report: {}".format(exc), file=sys.stderr)
             return 1
+    elif status == "interrupted":
+        print("No partial report saved. Use -o FILE on the next scan to save one.")
 
-    return 0
+    return 130 if status == "interrupted" else 0
 
 
 if __name__ == "__main__":
