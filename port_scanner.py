@@ -43,7 +43,7 @@ except ImportError:
 
 
 SCANNER_NAME = "python-port-scanner"
-SCANNER_VERSION = "4.2"
+SCANNER_VERSION = "4.3"
 REPORT_FORMATS = ("auto", "text", "json", "csv")
 
 
