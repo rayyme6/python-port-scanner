@@ -13,8 +13,9 @@ Only scan systems and networks you own or are explicitly authorized to test.
 Examples:
     python3 port_scanner.py 192.168.1.10 -p 1-1024
     python3 port_scanner.py example.com -p 22,80,443 --show-all
+    python3 port_scanner.py example.com --profile reliable --timeout 2
     python3 port_scanner.py example.com -p 443,8443 --banner-threads 5
-    sudo .venv/bin/python port_scanner.py 192.168.1.10 --syn
+    sudo .venv/bin/python port_scanner.py 192.168.1.10 --syn --profile reliable
 """
 
 import argparse
@@ -43,8 +44,34 @@ except ImportError:
 
 
 SCANNER_NAME = "python-port-scanner"
-SCANNER_VERSION = "4.3"
+SCANNER_VERSION = "4.4"
 REPORT_FORMATS = ("auto", "text", "json", "csv")
+
+DEFAULT_PROFILE = "balanced"
+PROFILE_SETTING_NAMES = ("timeout", "threads", "batch_size", "inter", "retries")
+SCAN_PROFILES = {
+    "fast": {
+        "timeout": 0.5,
+        "threads": 200,
+        "batch_size": 1024,
+        "inter": 0.0,
+        "retries": 0,
+    },
+    "balanced": {
+        "timeout": 1.0,
+        "threads": 100,
+        "batch_size": 512,
+        "inter": 0.001,
+        "retries": 1,
+    },
+    "reliable": {
+        "timeout": 1.5,
+        "threads": 50,
+        "batch_size": 256,
+        "inter": 0.003,
+        "retries": 2,
+    },
+}
 
 
 # Conventional service labels. These are fallbacks, not definitive proof of
@@ -1013,6 +1040,9 @@ def build_report_document(
     started_at,
     finished_at,
     open_only=False,
+    profile=DEFAULT_PROFILE,
+    effective_settings=None,
+    profile_overrides=None,
 ):
     """Build the structured document used by JSON reports."""
     report_results = select_report_results(results, open_only)
@@ -1034,6 +1064,9 @@ def build_report_document(
             "ports_scanned": len(results),
             "report_scope": "open-only" if open_only else "all-states",
             "results_written": len(report_results),
+            "profile": profile,
+            "profile_overrides": list(profile_overrides or []),
+            "effective_settings": normalized_scan_settings(effective_settings),
         },
         "summary": summary_dict(counts),
         "results": [normalized_result(result) for result in report_results],
@@ -1093,6 +1126,9 @@ def write_text_report(
     started_at,
     finished_at,
     open_only=False,
+    profile=DEFAULT_PROFILE,
+    effective_settings=None,
+    profile_overrides=None,
 ):
     report_results = select_report_results(results, open_only)
     counts = get_state_counts(results)
@@ -1102,6 +1138,21 @@ def write_text_report(
         report.write("Scanner   : {} {}\n".format(SCANNER_NAME, SCANNER_VERSION))
         report.write("Target    : {} ({})\n".format(target, ip))
         report.write("Scan type : {}\n".format(scan_type))
+        report.write("Profile   : {}\n".format(profile))
+        report.write("Overrides : {}\n".format(
+            ", ".join(profile_overrides or []) or "none"
+        ))
+        settings = normalized_scan_settings(effective_settings)
+        report.write(
+            "Settings  : timeout={:g}s, threads={}, batch-size={}, "
+            "inter={:g}s, retries={}\n".format(
+                settings["timeout"],
+                settings["threads"],
+                settings["batch_size"],
+                settings["inter"],
+                settings["retries"],
+            )
+        )
         report.write("Started   : {}\n".format(
             started_at.isoformat(timespec="seconds")
         ))
@@ -1139,6 +1190,9 @@ def write_json_report(
     started_at,
     finished_at,
     open_only=False,
+    profile=DEFAULT_PROFILE,
+    effective_settings=None,
+    profile_overrides=None,
 ):
     document = build_report_document(
         target,
@@ -1149,6 +1203,9 @@ def write_json_report(
         started_at,
         finished_at,
         open_only=open_only,
+        profile=profile,
+        effective_settings=effective_settings,
+        profile_overrides=profile_overrides,
     )
     with open(path, "w", encoding="utf-8") as report:
         json.dump(document, report, indent=2, ensure_ascii=False)
@@ -1165,6 +1222,9 @@ def write_csv_report(
     started_at,
     finished_at,
     open_only=False,
+    profile=DEFAULT_PROFILE,
+    effective_settings=None,
+    profile_overrides=None,
 ):
     report_results = select_report_results(results, open_only)
     fieldnames = [
@@ -1174,12 +1234,21 @@ def write_csv_report(
         "scan_type",
         "started_at",
         "duration_seconds",
+        "profile",
+        "profile_overrides",
+        "timeout",
+        "threads",
+        "batch_size",
+        "inter",
+        "retries",
         "port",
         "state",
         "service",
         "banner",
         "reason",
     ]
+
+    settings = normalized_scan_settings(effective_settings)
 
     with open(path, "w", encoding="utf-8", newline="") as report:
         writer = csv.DictWriter(report, fieldnames=fieldnames)
@@ -1193,6 +1262,9 @@ def write_csv_report(
                 "scan_type": scan_type,
                 "started_at": started_at.isoformat(timespec="seconds"),
                 "duration_seconds": "{:.6f}".format(elapsed),
+                "profile": profile,
+                "profile_overrides": ",".join(profile_overrides or []),
+                **settings,
                 **normalized,
             })
 
@@ -1208,6 +1280,9 @@ def write_report(
     finished_at,
     output_format="auto",
     open_only=False,
+    profile=DEFAULT_PROFILE,
+    effective_settings=None,
+    profile_overrides=None,
 ):
     """Write text, JSON, or CSV and return the resolved format and row count."""
     resolved_format = resolve_output_format(path, output_format)
@@ -1226,6 +1301,9 @@ def write_report(
         started_at,
         finished_at,
         open_only=open_only,
+        profile=profile,
+        effective_settings=effective_settings,
+        profile_overrides=profile_overrides,
     )
     return resolved_format, len(select_report_results(results, open_only))
 
@@ -1237,13 +1315,14 @@ def write_report(
 
 EPILOG = """Examples:
   python3 port_scanner.py 192.168.1.10 -p 1-1024
+  python3 port_scanner.py 192.168.1.10 --profile fast
+  python3 port_scanner.py example.com --profile reliable --timeout 2
+  sudo .venv/bin/python port_scanner.py 192.168.1.10 --syn --profile reliable
   python3 port_scanner.py example.com -p 22,80,443 --show-all
   python3 port_scanner.py example.com -p 443,8443 --banner-threads 5
-  python3 port_scanner.py 192.168.1.10 -o report.txt
   python3 port_scanner.py 192.168.1.10 -o report.json
   python3 port_scanner.py 192.168.1.10 -o report.csv --report-open-only
   python3 port_scanner.py 192.168.1.10 -o results.data --output-format json
-  sudo .venv/bin/python port_scanner.py 192.168.1.10 --syn --no-banner
 """
 
 
@@ -1291,6 +1370,54 @@ def non_negative_float(value):
     return number
 
 
+def resolve_scan_settings(args):
+    """Return profile settings after applying explicit command-line overrides."""
+    profile_name = getattr(args, "profile", DEFAULT_PROFILE)
+    try:
+        effective = dict(SCAN_PROFILES[profile_name])
+    except KeyError:
+        raise ValueError("unknown scan profile: {}".format(profile_name))
+
+    overrides = []
+    for name in PROFILE_SETTING_NAMES:
+        value = getattr(args, name, None)
+        if value is not None:
+            effective[name] = value
+            overrides.append(name)
+
+    return effective, overrides
+
+
+def normalized_scan_settings(settings=None):
+    """Return a stable typed representation of effective scan settings."""
+    normalized = dict(SCAN_PROFILES[DEFAULT_PROFILE])
+    if settings:
+        for name in PROFILE_SETTING_NAMES:
+            if name in settings:
+                normalized[name] = settings[name]
+
+    return {
+        "timeout": float(normalized["timeout"]),
+        "threads": int(normalized["threads"]),
+        "batch_size": int(normalized["batch_size"]),
+        "inter": float(normalized["inter"]),
+        "retries": int(normalized["retries"]),
+    }
+
+
+def format_scan_settings(settings, syn=False):
+    """Format the settings relevant to the selected scan engine."""
+    settings = normalized_scan_settings(settings)
+    common = "timeout={:g}s, retries={}".format(
+        settings["timeout"], settings["retries"]
+    )
+    if syn:
+        return "{}, batch-size={}, inter={:g}s".format(
+            common, settings["batch_size"], settings["inter"]
+        )
+    return "{}, threads={}".format(common, settings["threads"])
+
+
 def build_parser():
     parser = argparse.ArgumentParser(
         prog="port_scanner.py",
@@ -1308,28 +1435,34 @@ def build_parser():
         help="Ports such as '22,80,443' or '1-1024' (default: 1-1024)",
     )
     parser.add_argument(
-        "-t", "--timeout", type=positive_float, default=1.0,
-        help="Per-connection/per-batch timeout in seconds (default: 1.0)",
+        "--profile",
+        choices=tuple(SCAN_PROFILES),
+        default=DEFAULT_PROFILE,
+        help="Scan tuning preset (default: balanced)",
     )
     parser.add_argument(
-        "--threads", type=positive_int, default=100,
-        help="Connect-scan worker threads (default: 100)",
+        "-t", "--timeout", type=positive_float, default=None,
+        help="Override the profile timeout in seconds",
+    )
+    parser.add_argument(
+        "--threads", type=positive_int, default=None,
+        help="Override profile connect-scan worker threads",
     )
     parser.add_argument(
         "--syn", action="store_true",
         help="Use rate-controlled half-open SYN scanning through Scapy",
     )
     parser.add_argument(
-        "--batch-size", type=positive_int, default=512,
-        help="Initial SYN packets per batch (default: 512)",
+        "--batch-size", type=positive_int, default=None,
+        help="Override profile initial SYN packets per batch",
     )
     parser.add_argument(
-        "--inter", type=non_negative_float, default=0.001,
-        help="Delay between SYN packets in seconds (default: 0.001)",
+        "--inter", type=non_negative_float, default=None,
+        help="Override profile delay between SYN packets in seconds",
     )
     parser.add_argument(
-        "--retries", type=non_negative_int, default=1,
-        help="Retry unanswered/transient probes this many times (default: 1)",
+        "--retries", type=non_negative_int, default=None,
+        help="Override profile retry count for unanswered/transient probes",
     )
     parser.add_argument(
         "--no-banner", action="store_true",
@@ -1376,6 +1509,11 @@ def main():
         parser.error("--report-open-only requires --output")
 
     try:
+        effective_settings, profile_overrides = resolve_scan_settings(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+
+    try:
         ip = resolve_target(args.target)
         ports = parse_ports(args.ports)
     except ValueError as exc:
@@ -1383,8 +1521,13 @@ def main():
 
     print("\nTarget: {} ({})".format(args.target, ip))
     print("Ports : {}".format(len(ports)))
-    print("Mode  : {}\n".format(
+    print("Mode  : {}".format(
         "SYN scan (Scapy, batched)" if args.syn else "TCP connect scan (socket)"
+    ))
+    override_text = ", ".join(profile_overrides) or "none"
+    print("Profile: {} (overrides: {})".format(args.profile, override_text))
+    print("Tuning : {}\n".format(
+        format_scan_settings(effective_settings, syn=args.syn)
     ))
 
     scan_started_at = datetime.now().astimezone()
@@ -1395,10 +1538,10 @@ def main():
             results = syn_scan(
                 ip,
                 ports,
-                timeout=args.timeout,
-                batch_size=args.batch_size,
-                retries=args.retries,
-                inter=args.inter,
+                timeout=effective_settings["timeout"],
+                batch_size=effective_settings["batch_size"],
+                retries=effective_settings["retries"],
+                inter=effective_settings["inter"],
                 progress=not args.no_progress,
             )
             scan_type = "SYN scan (Scapy, batched)"
@@ -1406,9 +1549,9 @@ def main():
             results = tcp_connect_scan(
                 ip,
                 ports,
-                timeout=args.timeout,
-                max_threads=args.threads,
-                retries=args.retries,
+                timeout=effective_settings["timeout"],
+                max_threads=effective_settings["threads"],
+                retries=effective_settings["retries"],
                 progress=not args.no_progress,
             )
             scan_type = "TCP connect scan (socket)"
@@ -1421,7 +1564,7 @@ def main():
             args.target,
             ip,
             results,
-            args.timeout,
+            effective_settings["timeout"],
             max_workers=args.banner_threads,
             progress=not args.no_progress,
         )
@@ -1451,6 +1594,9 @@ def main():
                 scan_finished_at,
                 output_format=args.output_format,
                 open_only=args.report_open_only,
+                profile=args.profile,
+                effective_settings=effective_settings,
+                profile_overrides=profile_overrides,
             )
             scope = "open ports" if args.report_open_only else "all states"
             print(

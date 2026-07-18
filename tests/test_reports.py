@@ -67,6 +67,9 @@ def test_json_report_contains_metadata_summary_and_all_results(tmp_path, results
     assert rows == 3
     assert document["scanner"] == {"name": scanner.SCANNER_NAME, "version": scanner.SCANNER_VERSION}
     assert document["scan"]["report_scope"] == "all-states"
+    assert document["scan"]["profile"] == "balanced"
+    assert document["scan"]["profile_overrides"] == []
+    assert document["scan"]["effective_settings"] == scanner.SCAN_PROFILES["balanced"]
     assert document["summary"] == {"open": 1, "closed": 1, "filtered": 1, "error": 0}
     assert [row["port"] for row in document["results"]] == [22, 80, 81]
 
@@ -115,6 +118,9 @@ def test_csv_report_has_stable_columns_and_rows(tmp_path, results, timestamps):
     assert rows[1]["service"] == "HTTP"
     assert rows[1]["banner"] == "HTTP/1.1 200 OK"
     assert rows[1]["scanner_version"] == scanner.SCANNER_VERSION
+    assert rows[1]["profile"] == "balanced"
+    assert rows[1]["timeout"] == "1.0"
+    assert rows[1]["threads"] == "100"
 
 
 def test_text_report_contains_scope_summary_and_reason(tmp_path, results, timestamps):
@@ -133,7 +139,41 @@ def test_text_report_contains_scope_summary_and_reason(tmp_path, results, timest
 
     text = path.read_text(encoding="utf-8")
     assert f"Scanner   : {scanner.SCANNER_NAME} {scanner.SCANNER_VERSION}" in text
+    assert "Profile   : balanced" in text
+    assert "Overrides : none" in text
+    assert "Settings  : timeout=1s, threads=100, batch-size=512, inter=0.001s, retries=1" in text
     assert "Scope     : all states" in text
     assert "Summary   : 1 open, 1 closed, 1 filtered" in text
     assert "HTTP/1.1 200 OK" in text
     assert "timeout" in text
+
+
+def test_reports_record_profile_overrides_and_effective_settings(tmp_path, results, timestamps):
+    started, finished = timestamps
+    path = tmp_path / "reliable.json"
+    effective = {
+        "timeout": 2.0,
+        "threads": 50,
+        "batch_size": 256,
+        "inter": 0.003,
+        "retries": 2,
+    }
+
+    scanner.write_report(
+        path,
+        "router.local",
+        "192.0.2.1",
+        results,
+        1.25,
+        "TCP connect scan (socket)",
+        started,
+        finished,
+        profile="reliable",
+        effective_settings=effective,
+        profile_overrides=["timeout"],
+    )
+
+    document = json.loads(path.read_text(encoding="utf-8"))
+    assert document["scan"]["profile"] == "reliable"
+    assert document["scan"]["profile_overrides"] == ["timeout"]
+    assert document["scan"]["effective_settings"] == effective

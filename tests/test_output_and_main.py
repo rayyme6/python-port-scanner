@@ -92,6 +92,9 @@ def test_main_writes_requested_report(monkeypatch, tmp_path, capsys):
         captured["path"] = path
         captured["format"] = kwargs["output_format"]
         captured["open_only"] = kwargs["open_only"]
+        captured["profile"] = kwargs["profile"]
+        captured["effective_settings"] = kwargs["effective_settings"]
+        captured["profile_overrides"] = kwargs["profile_overrides"]
         return "json", 1
 
     monkeypatch.setattr(scanner, "write_report", write_report)
@@ -110,7 +113,14 @@ def test_main_writes_requested_report(monkeypatch, tmp_path, capsys):
     )
 
     assert scanner.main() == 0
-    assert captured == {"path": str(output), "format": "auto", "open_only": True}
+    assert captured == {
+        "path": str(output),
+        "format": "auto",
+        "open_only": True,
+        "profile": "balanced",
+        "effective_settings": scanner.SCAN_PROFILES["balanced"],
+        "profile_overrides": [],
+    }
     assert "Report written" in capsys.readouterr().out
 
 
@@ -134,3 +144,94 @@ def test_main_requires_output_for_output_options(monkeypatch):
     with pytest.raises(SystemExit) as exc_info:
         scanner.main()
     assert exc_info.value.code == 2
+
+
+def test_main_applies_connect_profile_and_manual_override(monkeypatch):
+    install_main_basics(monkeypatch)
+    captured = {}
+
+    def connect_scan(_ip, _ports, **kwargs):
+        captured.update(kwargs)
+        return [scanner.make_result(80, "open", "ok")]
+
+    monkeypatch.setattr(scanner, "tcp_connect_scan", connect_scan)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "port_scanner.py",
+            "example.test",
+            "--profile",
+            "reliable",
+            "--threads",
+            "80",
+            "--no-banner",
+        ],
+    )
+
+    assert scanner.main() == 0
+    assert captured == {
+        "timeout": 1.5,
+        "max_threads": 80,
+        "retries": 2,
+        "progress": True,
+    }
+
+
+def test_main_applies_syn_profile_settings(monkeypatch):
+    install_main_basics(monkeypatch)
+    captured = {}
+
+    def syn_scan(_ip, _ports, **kwargs):
+        captured.update(kwargs)
+        return [scanner.make_result(80, "closed", "RST")]
+
+    monkeypatch.setattr(scanner, "syn_scan", syn_scan)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "port_scanner.py",
+            "example.test",
+            "--syn",
+            "--profile",
+            "fast",
+            "--no-banner",
+        ],
+    )
+
+    assert scanner.main() == 0
+    assert captured == {
+        "timeout": 0.5,
+        "batch_size": 1024,
+        "retries": 0,
+        "inter": 0.0,
+        "progress": True,
+    }
+
+
+def test_main_displays_selected_profile_and_overrides(monkeypatch, capsys):
+    install_main_basics(monkeypatch)
+    monkeypatch.setattr(
+        scanner,
+        "tcp_connect_scan",
+        lambda *_a, **_k: [scanner.make_result(80, "open", "ok")],
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "port_scanner.py",
+            "example.test",
+            "--profile",
+            "reliable",
+            "--timeout",
+            "2",
+            "--no-banner",
+        ],
+    )
+
+    assert scanner.main() == 0
+    output = capsys.readouterr().out
+    assert "Profile: reliable (overrides: timeout)" in output
+    assert "Tuning : timeout=2s, retries=2, threads=50" in output
