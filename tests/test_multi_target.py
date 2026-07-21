@@ -7,6 +7,7 @@ import sys
 import pytest
 
 import port_scanner as scanner
+from portscanner import net
 
 
 def test_read_target_file_ignores_comments_and_blank_lines(tmp_path):
@@ -47,7 +48,7 @@ def test_collect_targets_expands_ipv6_cidr():
 
 def test_collect_targets_deduplicates_resolved_addresses(monkeypatch):
     addresses = {"one.test": "192.0.2.10", "two.test": "192.0.2.10"}
-    monkeypatch.setattr(scanner, "resolve_target", lambda target: addresses[target])
+    monkeypatch.setattr(net, "resolve_target", lambda target: addresses[target])
     targets = scanner.collect_targets(["one.test", "two.test", "192.0.2.10/32"])
     assert len(targets) == 1
     assert targets[0]["input"] == "one.test"
@@ -55,7 +56,7 @@ def test_collect_targets_deduplicates_resolved_addresses(monkeypatch):
 
 
 def test_collect_targets_counts_overlapping_cidr_only_once(monkeypatch):
-    monkeypatch.setattr(scanner, "resolve_target", lambda _target: "192.0.2.1")
+    monkeypatch.setattr(net, "resolve_target", lambda _target: "192.0.2.1")
     targets = scanner.collect_targets(
         ["router.test", "192.0.2.0/30"], max_targets=2
     )
@@ -65,7 +66,7 @@ def test_collect_targets_combines_cli_and_file(monkeypatch, tmp_path):
     path = tmp_path / "targets.txt"
     path.write_text("file.test\n", encoding="utf-8")
     addresses = {"cli.test": "192.0.2.1", "file.test": "192.0.2.2"}
-    monkeypatch.setattr(scanner, "resolve_target", lambda target: addresses[target])
+    monkeypatch.setattr(net, "resolve_target", lambda target: addresses[target])
     targets = scanner.collect_targets(["cli.test"], [path])
     assert [item["resolved_ip"] for item in targets] == ["192.0.2.1", "192.0.2.2"]
 

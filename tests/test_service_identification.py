@@ -3,6 +3,7 @@ import socket
 import pytest
 
 import port_scanner as scanner
+from portscanner import service_id
 
 
 class FakeSocket:
@@ -79,13 +80,13 @@ def test_probe_tls_detects_https_and_uses_sni(monkeypatch):
     tls = FakeTLS([b"HTTP/1.0 200 OK\r\nServer: test-server\r\n\r\n"])
     capture = {}
 
-    monkeypatch.setattr(scanner.socket, "create_connection", lambda *_a, **_k: raw)
+    monkeypatch.setattr(service_id.socket, "create_connection", lambda *_a, **_k: raw)
     monkeypatch.setattr(
-        scanner.ssl,
+        service_id.ssl,
         "SSLContext",
         lambda _protocol: FakeTLSContext(tls, capture),
     )
-    monkeypatch.setattr(scanner, "decode_certificate", lambda *_a, **_k: ["CN=example.test"])
+    monkeypatch.setattr(service_id, "decode_certificate", lambda *_a, **_k: ["CN=example.test"])
 
     service, banner = scanner.probe_tls(
         "example.test", "192.0.2.1", 4443, 1.0, probe_https=True
@@ -104,9 +105,9 @@ def test_probe_tls_omits_sni_for_ip_literal(monkeypatch):
     raw = FakeSocket()
     tls = FakeTLS()
     capture = {}
-    monkeypatch.setattr(scanner.socket, "create_connection", lambda *_a, **_k: raw)
-    monkeypatch.setattr(scanner.ssl, "SSLContext", lambda _p: FakeTLSContext(tls, capture))
-    monkeypatch.setattr(scanner, "decode_certificate", lambda *_a, **_k: [])
+    monkeypatch.setattr(service_id.socket, "create_connection", lambda *_a, **_k: raw)
+    monkeypatch.setattr(service_id.ssl, "SSLContext", lambda _p: FakeTLSContext(tls, capture))
+    monkeypatch.setattr(service_id, "decode_certificate", lambda *_a, **_k: [])
 
     service, banner = scanner.probe_tls("127.0.0.1", "127.0.0.1", 443, 1.0)
     assert service == "HTTPS"
@@ -115,7 +116,7 @@ def test_probe_tls_omits_sni_for_ip_literal(monkeypatch):
 
 
 def test_identify_service_uses_tls_probe_on_tls_port(monkeypatch):
-    monkeypatch.setattr(scanner, "probe_tls", lambda *_a, **_k: ("HTTPS", "TLS details"))
+    monkeypatch.setattr(service_id, "probe_tls", lambda *_a, **_k: ("HTTPS", "TLS details"))
     assert scanner.identify_service("example.test", "192.0.2.1", 443, 1.0) == (
         "HTTPS",
         "TLS details",
@@ -124,9 +125,9 @@ def test_identify_service_uses_tls_probe_on_tls_port(monkeypatch):
 
 def test_identify_service_reports_tls_handshake_failure(monkeypatch):
     def fail(*_args, **_kwargs):
-        raise scanner.ssl.SSLError("bad handshake")
+        raise service_id.ssl.SSLError("bad handshake")
 
-    monkeypatch.setattr(scanner, "probe_tls", fail)
+    monkeypatch.setattr(service_id, "probe_tls", fail)
     assert scanner.identify_service("example.test", "192.0.2.1", 443, 1.0) == (
         "HTTPS",
         "TLS handshake failed",
@@ -135,7 +136,7 @@ def test_identify_service_reports_tls_handshake_failure(monkeypatch):
 
 def test_identify_service_recognizes_passive_http(monkeypatch):
     sock = FakeSocket([b"HTTP/1.1 200 OK\r\nServer: passive-http\r\n\r\n"])
-    monkeypatch.setattr(scanner.socket, "socket", lambda *_a, **_k: sock)
+    monkeypatch.setattr(service_id.socket, "socket", lambda *_a, **_k: sock)
     assert scanner.identify_service("router.local", "192.0.2.1", 80, 1.0) == (
         "HTTP",
         "passive-http",
@@ -144,7 +145,7 @@ def test_identify_service_recognizes_passive_http(monkeypatch):
 
 def test_identify_service_recognizes_passive_ssh(monkeypatch):
     sock = FakeSocket([b"SSH-2.0-UnitTest\r\n"])
-    monkeypatch.setattr(scanner.socket, "socket", lambda *_a, **_k: sock)
+    monkeypatch.setattr(service_id.socket, "socket", lambda *_a, **_k: sock)
     assert scanner.identify_service("host.local", "192.0.2.2", 22, 1.0) == (
         "SSH",
         "SSH-2.0-UnitTest",
@@ -153,8 +154,8 @@ def test_identify_service_recognizes_passive_ssh(monkeypatch):
 
 def test_identify_service_tries_tls_on_unknown_silent_port(monkeypatch):
     silent = FakeSocket([socket.timeout()])
-    monkeypatch.setattr(scanner.socket, "socket", lambda *_a, **_k: silent)
-    monkeypatch.setattr(scanner, "probe_tls", lambda *_a, **_k: ("TLS", "TLSv1.3"))
+    monkeypatch.setattr(service_id.socket, "socket", lambda *_a, **_k: silent)
+    monkeypatch.setattr(service_id, "probe_tls", lambda *_a, **_k: ("TLS", "TLSv1.3"))
     assert scanner.identify_service("host.local", "192.0.2.2", 4444, 1.0) == (
         "TLS",
         "TLSv1.3",
@@ -164,8 +165,8 @@ def test_identify_service_tries_tls_on_unknown_silent_port(monkeypatch):
 def test_identify_service_plain_http_fallback(monkeypatch):
     silent = FakeSocket([socket.timeout()])
     http = FakeSocket([b"HTTP/1.0 404 Not Found\r\n\r\n"])
-    monkeypatch.setattr(scanner.socket, "socket", lambda *_a, **_k: silent)
-    monkeypatch.setattr(scanner.socket, "create_connection", lambda *_a, **_k: http)
+    monkeypatch.setattr(service_id.socket, "socket", lambda *_a, **_k: silent)
+    monkeypatch.setattr(service_id.socket, "create_connection", lambda *_a, **_k: http)
 
     assert scanner.identify_service("router.local", "192.0.2.1", 80, 1.0) == (
         "HTTP",
@@ -184,7 +185,7 @@ def test_identify_open_services_updates_open_rows_only(monkeypatch):
     def identify(_target, _ip, port, _timeout):
         return ("HTTP" if port == 80 else "HTTPS", f"banner-{port}")
 
-    monkeypatch.setattr(scanner, "identify_service", identify)
+    monkeypatch.setattr(service_id, "identify_service", identify)
     scanner.identify_open_services(
         "example.test", "192.0.2.1", results, 1.0, max_workers=2, progress=False
     )
@@ -197,7 +198,7 @@ def test_identify_open_services_updates_open_rows_only(monkeypatch):
 
 def test_identify_open_services_returns_immediately_without_open_ports(monkeypatch):
     monkeypatch.setattr(
-        scanner,
+        service_id,
         "identify_service",
         lambda *_a, **_k: pytest.fail("should not be called"),
     )

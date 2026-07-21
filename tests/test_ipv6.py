@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import port_scanner as scanner
+from portscanner import connect_scan, net, synscan
 
 
 def test_address_family_helpers_support_ipv4_and_ipv6():
@@ -104,8 +105,8 @@ def test_connect_probe_uses_ipv6_socket_and_endpoint(monkeypatch):
         created["socktype"] = socktype
         return fake
 
-    monkeypatch.setattr(scanner.socket, "socket", factory)
-    result = scanner._connect_probe("2001:db8::1", 443, 0.25)
+    monkeypatch.setattr(connect_scan.socket, "socket", factory)
+    result = connect_scan._connect_probe("2001:db8::1", 443, 0.25)
 
     assert result["state"] == "open"
     assert created == {"family": socket.AF_INET6, "socktype": socket.SOCK_STREAM}
@@ -142,9 +143,9 @@ def test_build_syn_packets_uses_ipv6_layer(monkeypatch):
         def __call__(self, **kwargs):
             return FakePacket([(self.layer_type, SimpleNamespace(**kwargs))])
 
-    monkeypatch.setattr(scanner, "IP", LayerFactory(ipv4_layer), raising=False)
-    monkeypatch.setattr(scanner, "IPv6", LayerFactory(ipv6_layer), raising=False)
-    monkeypatch.setattr(scanner, "TCP", LayerFactory(tcp_layer), raising=False)
+    monkeypatch.setattr(synscan, "IP", LayerFactory(ipv4_layer), raising=False)
+    monkeypatch.setattr(synscan, "IPv6", LayerFactory(ipv6_layer), raising=False)
+    monkeypatch.setattr(synscan, "TCP", LayerFactory(tcp_layer), raising=False)
 
     packet = scanner.build_syn_packets("2001:db8::1", [443])[0]
     assert packet.haslayer(ipv6_layer)
@@ -166,9 +167,9 @@ def test_classify_icmpv6_error_as_filtered(monkeypatch):
                 return SimpleNamespace(type=1, code=1)
             raise KeyError(layer)
 
-    monkeypatch.setattr(scanner, "TCP", tcp_layer, raising=False)
-    monkeypatch.setattr(scanner, "ICMP", icmp_layer, raising=False)
-    monkeypatch.setattr(scanner, "ICMPV6_ERROR_LAYERS", (icmpv6_layer,))
+    monkeypatch.setattr(synscan, "TCP", tcp_layer, raising=False)
+    monkeypatch.setattr(synscan, "ICMP", icmp_layer, raising=False)
+    monkeypatch.setattr(synscan, "ICMPV6_ERROR_LAYERS", (icmpv6_layer,))
 
     state, reason = scanner.classify_syn_response(FakeResponse())
     assert state == "filtered"
@@ -224,7 +225,7 @@ def test_main_passes_ipv6_preference_to_resolver(monkeypatch, capsys):
         captured["family"] = family
         return "2001:db8::20"
 
-    monkeypatch.setattr(scanner, "resolve_target", fake_resolve)
+    monkeypatch.setattr(net, "resolve_target", fake_resolve)
     monkeypatch.setattr(scanner, "parse_ports", lambda _spec: [80])
     monkeypatch.setattr(
         scanner,

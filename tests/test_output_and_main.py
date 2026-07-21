@@ -4,6 +4,7 @@ import sys
 import pytest
 
 import port_scanner as scanner
+from portscanner import net
 
 
 def test_print_results_open_only(capsys):
@@ -48,7 +49,7 @@ def test_numeric_argument_validators(function, valid, invalid_text, invalid_rang
 
 
 def install_main_basics(monkeypatch):
-    monkeypatch.setattr(scanner, "resolve_target", lambda _target: "192.0.2.1")
+    monkeypatch.setattr(net, "resolve_target", lambda _target: "192.0.2.1")
     monkeypatch.setattr(scanner, "parse_ports", lambda _spec: [80])
     monkeypatch.setattr(scanner, "identify_open_services", lambda *_a, **_k: None)
     monkeypatch.setattr(scanner, "print_results", lambda *_a, **_k: None)

@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 import port_scanner as scanner
+from portscanner import synscan
 
 
 TCP_LAYER = object()
@@ -28,8 +29,8 @@ class FakeResponse:
 
 
 def install_layers(monkeypatch):
-    monkeypatch.setattr(scanner, "TCP", TCP_LAYER, raising=False)
-    monkeypatch.setattr(scanner, "ICMP", ICMP_LAYER, raising=False)
+    monkeypatch.setattr(synscan, "TCP", TCP_LAYER, raising=False)
+    monkeypatch.setattr(synscan, "ICMP", ICMP_LAYER, raising=False)
 
 
 def test_syn_ack_is_open(monkeypatch):
@@ -80,16 +81,16 @@ class FakeSent:
 
 def test_syn_scan_retries_unanswered_ports_without_sending_packets(monkeypatch):
     install_layers(monkeypatch)
-    monkeypatch.setattr(scanner, "SCAPY_AVAILABLE", True)
-    monkeypatch.setattr(scanner.os, "geteuid", lambda: 0)
-    monkeypatch.setattr(scanner, "conf", SimpleNamespace(verb=1), raising=False)
+    monkeypatch.setattr(synscan, "SCAPY_AVAILABLE", True)
+    monkeypatch.setattr(synscan.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(synscan, "conf", SimpleNamespace(verb=1), raising=False)
 
     sent_by_port = {
         22: FakeSent(22, 40022),
         80: FakeSent(80, 40080),
     }
     monkeypatch.setattr(
-        scanner,
+        synscan,
         "build_syn_packets",
         lambda _ip, ports: [sent_by_port[port] for port in ports],
     )
@@ -108,8 +109,8 @@ def test_syn_scan_retries_unanswered_ports_without_sending_packets(monkeypatch):
             [],
         )
 
-    monkeypatch.setattr(scanner, "sr", fake_sr, raising=False)
-    monkeypatch.setattr(scanner, "send", lambda *_a, **_k: None, raising=False)
+    monkeypatch.setattr(synscan, "sr", fake_sr, raising=False)
+    monkeypatch.setattr(synscan, "send", lambda *_a, **_k: None, raising=False)
 
     results = scanner.syn_scan(
         "192.0.2.1",
@@ -128,13 +129,13 @@ def test_syn_scan_retries_unanswered_ports_without_sending_packets(monkeypatch):
 
 def test_syn_scan_marks_persistent_no_response_filtered(monkeypatch, capsys):
     install_layers(monkeypatch)
-    monkeypatch.setattr(scanner, "SCAPY_AVAILABLE", True)
-    monkeypatch.setattr(scanner.os, "geteuid", lambda: 0)
-    monkeypatch.setattr(scanner, "conf", SimpleNamespace(verb=1), raising=False)
+    monkeypatch.setattr(synscan, "SCAPY_AVAILABLE", True)
+    monkeypatch.setattr(synscan.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(synscan, "conf", SimpleNamespace(verb=1), raising=False)
     sent = FakeSent(22, 40022)
-    monkeypatch.setattr(scanner, "build_syn_packets", lambda *_a, **_k: [sent])
-    monkeypatch.setattr(scanner, "sr", lambda packets, **_k: ([], packets), raising=False)
-    monkeypatch.setattr(scanner, "send", lambda *_a, **_k: None, raising=False)
+    monkeypatch.setattr(synscan, "build_syn_packets", lambda *_a, **_k: [sent])
+    monkeypatch.setattr(synscan, "sr", lambda packets, **_k: ([], packets), raising=False)
+    monkeypatch.setattr(synscan, "send", lambda *_a, **_k: None, raising=False)
 
     results = scanner.syn_scan(
         "192.0.2.1", [22], timeout=0.1, retries=0, progress=False

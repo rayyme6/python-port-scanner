@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import port_scanner as scanner
+from portscanner import connect_scan, net, service_id, synscan
 
 
 class FakeFuture:
@@ -73,8 +74,8 @@ def test_connect_scan_preserves_completed_results_on_interrupt(monkeypatch):
     pending = FakeFuture(done=False)
     executor = FakeExecutor([first, pending])
 
-    monkeypatch.setattr(scanner, "ThreadPoolExecutor", lambda **_kwargs: executor)
-    monkeypatch.setattr(scanner, "as_completed", interrupt_after_first)
+    monkeypatch.setattr(connect_scan, "ThreadPoolExecutor", lambda **_kwargs: executor)
+    monkeypatch.setattr(connect_scan, "as_completed", interrupt_after_first)
 
     with pytest.raises(scanner.ScanInterrupted) as exc_info:
         scanner.tcp_connect_scan(
@@ -99,8 +100,8 @@ def test_service_identification_preserves_completed_banners_on_interrupt(monkeyp
         scanner.make_result(443, "open", "ok"),
     ]
 
-    monkeypatch.setattr(scanner, "ThreadPoolExecutor", lambda **_kwargs: executor)
-    monkeypatch.setattr(scanner, "as_completed", interrupt_after_first)
+    monkeypatch.setattr(service_id, "ThreadPoolExecutor", lambda **_kwargs: executor)
+    monkeypatch.setattr(service_id, "as_completed", interrupt_after_first)
 
     with pytest.raises(scanner.ScanInterrupted) as exc_info:
         scanner.identify_open_services(
@@ -137,21 +138,21 @@ def test_syn_scan_preserves_classified_responses_on_interrupt(monkeypatch):
         def haslayer(self, _layer):
             return False
 
-    monkeypatch.setattr(scanner, "SCAPY_AVAILABLE", True)
-    monkeypatch.setattr(scanner.os, "geteuid", lambda: 0)
-    monkeypatch.setattr(scanner, "conf", SimpleNamespace(verb=1), raising=False)
-    monkeypatch.setattr(scanner, "TCP", tcp_layer, raising=False)
+    monkeypatch.setattr(synscan, "SCAPY_AVAILABLE", True)
+    monkeypatch.setattr(synscan.os, "geteuid", lambda: 0)
+    monkeypatch.setattr(synscan, "conf", SimpleNamespace(verb=1), raising=False)
+    monkeypatch.setattr(synscan, "TCP", tcp_layer, raising=False)
     monkeypatch.setattr(
-        scanner,
+        synscan,
         "build_syn_packets",
         lambda _ip, ports: [FakeSent(port) for port in ports],
     )
     monkeypatch.setattr(
-        scanner,
+        synscan,
         "classify_syn_response",
         lambda _response: ("closed", "RST"),
     )
-    monkeypatch.setattr(scanner, "send", lambda *_a, **_k: None, raising=False)
+    monkeypatch.setattr(synscan, "send", lambda *_a, **_k: None, raising=False)
 
     calls = 0
 
@@ -162,7 +163,7 @@ def test_syn_scan_preserves_classified_responses_on_interrupt(monkeypatch):
             return [(packets[0], FakeResponse())], packets[1:]
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(scanner, "sr", fake_sr, raising=False)
+    monkeypatch.setattr(synscan, "sr", fake_sr, raising=False)
 
     with pytest.raises(scanner.ScanInterrupted) as exc_info:
         scanner.syn_scan(
@@ -283,7 +284,7 @@ def test_csv_report_includes_partial_metadata(tmp_path, interrupted_report_data)
 
 
 def install_main_basics(monkeypatch):
-    monkeypatch.setattr(scanner, "resolve_target", lambda _target: "192.0.2.1")
+    monkeypatch.setattr(net, "resolve_target", lambda _target: "192.0.2.1")
     monkeypatch.setattr(scanner, "parse_ports", lambda _spec: [22, 23, 80])
     monkeypatch.setattr(scanner, "print_results", lambda *_a, **_k: None)
     monkeypatch.setattr(scanner.time, "perf_counter", lambda: 10.0)
@@ -382,7 +383,7 @@ class FailingExecutor(FakeExecutor):
 def test_connect_scan_cleans_up_executor_on_non_interrupt_failure(monkeypatch):
     pending = FakeFuture(done=False)
     executor = FailingExecutor(pending)
-    monkeypatch.setattr(scanner, "ThreadPoolExecutor", lambda **_kwargs: executor)
+    monkeypatch.setattr(connect_scan, "ThreadPoolExecutor", lambda **_kwargs: executor)
 
     with pytest.raises(RuntimeError, match="submission failed"):
         scanner.tcp_connect_scan(
@@ -396,7 +397,7 @@ def test_connect_scan_cleans_up_executor_on_non_interrupt_failure(monkeypatch):
 def test_service_identification_cleans_up_executor_on_failure(monkeypatch):
     pending = FakeFuture(done=False)
     executor = FailingExecutor(pending)
-    monkeypatch.setattr(scanner, "ThreadPoolExecutor", lambda **_kwargs: executor)
+    monkeypatch.setattr(service_id, "ThreadPoolExecutor", lambda **_kwargs: executor)
     results = [
         scanner.make_result(80, "open", "ok"),
         scanner.make_result(443, "open", "ok"),

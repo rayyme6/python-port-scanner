@@ -3,6 +3,7 @@ import hashlib
 import pytest
 
 import port_scanner as scanner
+from portscanner import service_id
 
 
 def certificate(*, common_name="", dns_names=(), ip_names=()):
@@ -71,6 +72,6 @@ def test_decode_certificate_falls_back_to_sha256(monkeypatch):
     def fail_conversion(_value):
         raise ValueError("invalid")
 
-    monkeypatch.setattr(scanner.ssl, "DER_cert_to_PEM_cert", fail_conversion)
+    monkeypatch.setattr(service_id.ssl, "DER_cert_to_PEM_cert", fail_conversion)
     expected = hashlib.sha256(der).hexdigest()[:16]
     assert scanner.decode_certificate(der, "example.test") == [f"cert SHA256 {expected}"]
